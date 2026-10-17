@@ -1650,9 +1650,9 @@ export async function readRawTraceRequestLogBundle(
   const url = sanitizeUrlForLog(rawUrl);
   const clientRequestHeaders = headerRecordFromUnknown(clientRequestMetadata?.headers);
   const upstreamRequestHeaders = headerRecordFromUnknown(upstreamRequestMetadata?.headers);
-  const requestId = stringValue(readUnknownHeader(upstreamRequestHeaders, "x-client-request-id")) ||
-    stringValue(manifest.turnKey) ||
-    bundleId;
+  const clientReqId = stringValue(readUnknownHeader(upstreamRequestHeaders, "x-client-request-id"));
+  const turnKey = stringValue(manifest.turnKey);
+  const requestId = clientReqId && clientReqId !== turnKey ? clientReqId : bundleId;
   const client = inferGatewayClient(undefined, clientRequestHeaders ?? {});
   const attempt = positiveAttemptNumber(readUnknownHeader(
     clientRequestHeaders,
