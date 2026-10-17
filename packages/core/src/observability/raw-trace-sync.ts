@@ -1619,12 +1619,13 @@ export async function readRawTraceRequestLogBundle(
   manifest: Record<string, unknown>,
   spoolDirectory = RAW_TRACE_SPOOL_DIR
 ): Promise<RawTraceRequestLogBundle | undefined> {
-  const requestId = stringValue(manifest.turnKey) || stringValue(manifest.requestId);
-  const bundleId = stringValue(manifest.requestId);
+  // Each gateway HTTP request has its own x-client-request-id; turnKey is a
+  // longer-lived conversation key and must not collapse separate requests.
+  const bundleId = stringValue(manifest.requestId) || stringValue(manifest.turnKey) || "";
   const parts = Array.isArray(manifest.parts)
     ? manifest.parts.filter((part): part is Record<string, unknown> => isRecord(part))
     : [];
-  if (!requestId || parts.length === 0) {
+  if (!bundleId || parts.length === 0) {
     return undefined;
   }
 
@@ -1649,6 +1650,9 @@ export async function readRawTraceRequestLogBundle(
   const url = sanitizeUrlForLog(rawUrl);
   const clientRequestHeaders = headerRecordFromUnknown(clientRequestMetadata?.headers);
   const upstreamRequestHeaders = headerRecordFromUnknown(upstreamRequestMetadata?.headers);
+  const requestId = stringValue(readUnknownHeader(upstreamRequestHeaders, "x-client-request-id")) ||
+    stringValue(manifest.turnKey) ||
+    bundleId;
   const client = inferGatewayClient(undefined, clientRequestHeaders ?? {});
   const attempt = positiveAttemptNumber(readUnknownHeader(
     clientRequestHeaders,

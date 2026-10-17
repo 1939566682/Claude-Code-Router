@@ -134,6 +134,16 @@ export function logBodyKey(body: RequestLogBody | undefined): string {
   ]);
 }
 
+const hardLogBodyInlineLimit = 8 * 1024 * 1024;
+const streamedDataHardLimit = 500;
+
+function truncateStreamedData<T extends Record<string, unknown>>(value: T): T {
+  const data = (value as Record<string, unknown>).streamed_data;
+  if (!Array.isArray(data) || data.length <= streamedDataHardLimit) return value;
+  const truncated = data.slice(0, streamedDataHardLimit);
+  return { ...value, streamed_data: truncated, streamed_data_truncated: data.length - truncated.length } as T;
+}
+
 export function formatLogBodyView(body: RequestLogBody | undefined): FormattedLogBody {
   if (!body || (!body.text && body.sizeBytes === 0)) {
     return { text: "No body" };
@@ -143,16 +153,29 @@ export function formatLogBodyView(body: RequestLogBody | undefined): FormattedLo
   }
 
   const text = body.text || "";
+  if (text.length > hardLogBodyInlineLimit) {
+    return { text: `Body too large to format inline (${text.length} chars). Use chunked view.` };
+  }
   const json = parseLogJson(text);
   if (json !== undefined) {
-    const normalizedJson = aggregateParsedStreamJson(json);
-    return { json: normalizedJson, text: JSON.stringify(normalizedJson, null, 2) };
+    const normalizedJson = aggregateParsedStreamJson(json) as Record<string, unknown> | unknown;
+    const truncated = isPlainRecord(normalizedJson) ? truncateStreamedData(normalizedJson as Record<string, unknown>) : normalizedJson;
+    try {
+      return { json: truncated, text: JSON.stringify(truncated, null, 2) };
+    } catch {
+      return { json: truncated, text };
+    }
   }
 
   const streamPayloads = parseLogStreamPayloads(text);
   if (streamPayloads.length > 0) {
-    const streamedJson = aggregateLogStreamPayloads(streamPayloads);
-    return { json: streamedJson, text: JSON.stringify(streamedJson, null, 2) };
+    const streamedJson = aggregateLogStreamPayloads(streamPayloads) as Record<string, unknown>;
+    const truncated = truncateStreamedData(streamedJson);
+    try {
+      return { json: truncated, text: JSON.stringify(truncated, null, 2) };
+    } catch {
+      return { json: truncated, text };
+    }
   }
 
   return { text: text || "No body" };

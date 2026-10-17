@@ -115,6 +115,8 @@ export type AddProviderDraft = {
   protocol: GatewayProviderProtocol;
   selectedModels: string[];
   selectedProtocols: GatewayProviderProtocol[];
+  softRateLimitRpm: string;
+  softRateLimitTpm: string;
   usageBalanceLimitPath: string;
   usageBalanceRemainingPath: string;
   usageBalanceUnit: string;

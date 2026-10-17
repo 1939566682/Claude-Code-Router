@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -312,6 +312,45 @@ test("RequestLogStore keeps list rows lightweight and detail rows complete", asy
     assert.equal(detail.responseModel, "response-model");
     assert.match(detail.requestBody.text, /request-model/);
     assert.match(detail.responseBody?.text ?? "", /response-model/);
+  } finally {
+    await store?.close();
+    rmSync(dir, { force: true, recursive: true });
+  }
+});
+
+test("RequestLogStore capacity retention prunes oldest request rows and their body files", async () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "ccr-request-log-capacity-retention-test-"));
+  let store;
+  try {
+    store = new RequestLogStore(path.join(dir, "request-logs.sqlite"), undefined, 3, 0);
+    for (let index = 1; index <= 5; index += 1) {
+      const timestamp = new Date(Date.now() + index * 1000).toISOString();
+      await store.record({
+        completedAt: timestamp,
+        durationMs: 1,
+        method: "POST",
+        path: "/v1/messages",
+        providerName: "test-provider",
+        requestBody: Buffer.from(JSON.stringify({ content: "x".repeat(200 * 1024), model: "test-model" })),
+        requestHeaders: { "content-type": "application/json" },
+        requestId: `retained-request-${index}`,
+        responseBodyText: JSON.stringify({ output: index }),
+        responseHeaders: { "content-type": "application/json" },
+        startedAt: timestamp,
+        statusCode: 200,
+        url: "http://127.0.0.1:3456/v1/messages"
+      });
+    }
+
+    const page = await store.list({ pageSize: 10 });
+    assert.equal(page.total, 3);
+    assert.deepEqual(page.items.map((item) => item.requestId).sort(), [
+      "retained-request-3",
+      "retained-request-4",
+      "retained-request-5"
+    ]);
+    const bodyDirectory = path.join(dir, "request-log-bodies");
+    assert.equal(readdirSync(bodyDirectory).length, 3);
   } finally {
     await store?.close();
     rmSync(dir, { force: true, recursive: true });
@@ -1859,6 +1898,10 @@ test("RequestLogStore analyzes large bodies without dropping agent metadata", {
     assert.equal(analysis.totals.requestCount, requestCount);
     assert.equal(analysis.sessions[0]?.id, "large-session");
     assert.equal(analysis.tools[0]?.name, "read_file");
+    const selected = await store.analyze({ range: "30d", sessionId: "large-session", sessionAgent: "codex" });
+    assert.equal(selected.selectedSession?.session.id, "large-session");
+    assert.equal(selected.selectedSession?.requests[0]?.requestBody.text, "");
+    assert.equal(selected.selectedSession?.requests[0]?.requestBody.truncated, true);
   } finally {
     await store?.close();
     rmSync(dir, { force: true, recursive: true });
@@ -1874,7 +1917,7 @@ test("RequestLogStore streams more body text than the bounded worker heap", {
   try {
     const dbFile = path.join(dir, "request-logs.sqlite");
     store = new RequestLogStore(dbFile);
-    const requestCount = 384;
+    const requestCount = 5000;
     const totalBodyBytes = await recordLargeAgentRequests(store, dbFile, {
       paddingBytes: 256 * 1024,
       requestCount,

@@ -124,10 +124,7 @@ class GatewayService {
   private externalGatewayApiKey?: string;
   private plugin?: ClaudeCodeRouterPlugin;
   private readonly rawTraceSynchronizer = new RawTraceSynchronizer({
-    allowStandaloneRequestLogs: () => {
-      const config = this.config;
-      return Boolean(config && shouldUseSingleGatewayRuntime(config));
-    },
+    allowStandaloneRequestLogs: () => true, // realtime: every Codex POST /v1/responses is a standalone row (was gated by shouldUseSingleGatewayRuntime)
     getConfig: () => this.config
   });
   private readonly routeScriptRuntime = new RouteScriptRuntime();

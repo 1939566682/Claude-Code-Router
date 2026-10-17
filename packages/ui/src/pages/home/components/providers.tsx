@@ -2345,6 +2345,7 @@ export function AddProviderForm({
             </div>
           </>
         ) : null}
+        <ProviderSoftRateLimitSection draft={draft} onChange={onChange} />
         {showStep("models") ? (
           <>
             <ProviderFormStepHeader
@@ -2881,6 +2882,56 @@ function ProviderCredentialRow({
           </AnimatedDisclosure>
         ) : null}
       </AnimatePresence>
+    </div>
+  );
+}
+
+function ProviderSoftRateLimitSection({
+  draft,
+  onChange
+}: {
+  draft: AddProviderDraft;
+  onChange: (patch: Partial<AddProviderDraft>, resetProbe?: boolean) => void;
+}) {
+  const t = useAppText();
+  return (
+    <div className="sm:col-span-2 rounded-md border border-border bg-muted/20 p-3">
+      <div className="flex min-w-0 items-center gap-1.5">
+        <span className="text-[12px] font-semibold text-foreground">{t("供应商限流（软限流）")}</span>
+        <Tooltip
+          aria-label={t("打满等下一分钟，不抛 429，ZCode/Codex/curl 共用同一分钟窗口")}
+          className="h-5 w-5 items-center justify-center rounded-full text-muted-foreground outline-none focus-visible:ring-2 focus-visible:ring-ring/30"
+          content={t("打满等下一分钟，不抛 429，ZCode/Codex/curl 共用同一分钟窗口")}
+          contentClassName="w-[260px] max-w-[calc(100vw-64px)] whitespace-normal px-2.5 py-2 text-left font-medium leading-4"
+          side="right"
+          tabIndex={0}
+        >
+          <Info className="h-3.5 w-3.5" aria-hidden="true" />
+        </Tooltip>
+      </div>
+      <div className="mt-1 text-[11px] leading-4 text-muted-foreground">{t("打满等下一分钟，不抛 429，ZCode/Codex/curl 共用同一分钟窗口")}</div>
+      <div className="mt-3 grid grid-cols-1 gap-3 sm:grid-cols-2">
+        <Field label={t("RPM")}>
+          <Input
+            min={1}
+            max={100000}
+            placeholder={t("不限")}
+            type="number"
+            value={draft.softRateLimitRpm}
+            onChange={(event) => onChange({ softRateLimitRpm: event.target.value })}
+          />
+        </Field>
+        <Field label={t("TPM")}>
+          <Input
+            min={1}
+            max={10000000}
+            placeholder={t("不限")}
+            type="number"
+            value={draft.softRateLimitTpm}
+            onChange={(event) => onChange({ softRateLimitTpm: event.target.value })}
+          />
+        </Field>
+      </div>
     </div>
   );
 }

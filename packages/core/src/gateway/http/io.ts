@@ -32,6 +32,9 @@ function inferClientFromUserAgent(headers: IncomingHttpHeaders): string | undefi
   }
 
   const normalized = userAgent.toLowerCase();
+  if (normalized.includes("zcode") || normalized.includes("z-code") || normalized.includes("z_code")) {
+    return "ZCode";
+  }
   if (normalized.includes("codex")) {
     return "Codex";
   }

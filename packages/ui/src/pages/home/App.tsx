@@ -22,6 +22,7 @@ import {
   normalizeTrayWidgets, normalizeTrayWindowModules, normalizeVirtualModelDraftPatch, OnboardingReadinessOptions, OnboardingStepId, onboardingStepOrder,
   OverviewWidgetConfig, parseProviderAccountDraft, parseProviderExtraJsonDraft, pluginConfigPatchFromSettingsDraft,
   providerCredentialsFromDraft,
+  providerSoftRateLimitsFromDraft,
   persistLanguagePreference, PluginInstallCandidate, PluginMarketplaceEntry, PluginRoutingConfigTarget, PluginSettingsDraft, presetCapabilitiesFromDraft,
   probeProviderCandidates, probeProviderDeepLinkPayload, profileAgentLabel, profileAgentOptionsForRuntime, profileDraftWithDetectedAppPath, profileEnvRowsForAgent, ProfileConfig, ProfileOpenSurface, ProfileRuntimeStatus, profileConfigFromDraft, providerAccountApiKeySafetyIssue,
   profileOpenCommandFallback, profileOpenSurfaces, ProviderAccountSnapshot, providerApiKeySafetyIssue, ProviderConnectivityCheckReport, ProviderDeepLinkPayload, ProviderDeepLinkRequest, providerIdentitySafetyIssue, providerProbeCandidates,
@@ -1826,6 +1827,11 @@ function App() {
     }
 
     const providerId = existingProvider?.id ?? providerNameSlug(providerName);
+    const softRateLimits = providerSoftRateLimitsFromDraft(providerDraft);
+    if (typeof softRateLimits === "string") {
+      setProviderProbeError(translateAppErrorMessage(copy, softRateLimits));
+      return false;
+    }
     const autoFetchKnownModels = providerAutoFetchKnownModelsForSave({
       currentModels: models,
       detectedModels: saveProbe?.models ?? probe?.models ?? [],
@@ -1853,6 +1859,7 @@ function App() {
       models,
       name: providerName,
       protocolDetectionMode: providerDraft.protocolDetectionMode === "manual" ? "manual" : undefined,
+      softRateLimits: softRateLimits ?? undefined,
       type: protocol
     };
     const importedProviderPlugins = materializeProviderPluginTemplates(providerDraft.providerPlugins, providerName, protocol, providerId);

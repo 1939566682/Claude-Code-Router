@@ -306,6 +306,10 @@ export class GatewayRequestPipeline {
         }
         const bodyCapture = config.observability.requestLogBodyCapture ?? "all";
         const captureBody = bodyCapture === "all" || (bodyCapture === "errors" && !successful);
+        // errors 模式下成功请求的正文不持久化，但 usage 仍需从 responseBodyText 解析；
+        // record() 内部会在 bodyCapturePolicy=errors + successful 时剥离正文，只保留 usage。
+        // 失败请求保留响应正文便于排障，请求正文/请求头跟随 errors 策略同样剥离。
+        const persistRequestHeaders = bodyCapture === "errors" && successful ? undefined : headers;
         recordGatewayRequestLog({
           bodyCapturePolicy: bodyCapture,
           captureBody,
@@ -327,7 +331,7 @@ export class GatewayRequestPipeline {
           providerProtocol: resolveResponseProviderProtocol(responseHeaders, this.config),
           requestedModel,
           requestBody: shouldSendBody(method) ? bodyToForward ?? Buffer.alloc(0) : Buffer.alloc(0),
-          requestHeaders: headers,
+          requestHeaders: persistRequestHeaders ?? headers,
           requestId,
           resolvedModel: routedModel,
           routeTrace: routeTrace?.finish({ captureBodyValues: captureBody }),

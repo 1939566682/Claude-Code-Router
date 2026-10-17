@@ -40,6 +40,7 @@ import type {
   GatewayProviderCapability,
   GatewayProviderCapabilityProtocol,
   GatewayProviderConfig,
+  ProviderSoftRateLimitConfig,
   MediaToolsConfig,
   ObservabilityConfig,
   OverviewAccountCardSize,
@@ -531,6 +532,21 @@ export function normalizeProviderPresetCapabilitiesForTest(
 
 export function parseProvidersForTest(value: unknown): GatewayProviderConfig[] | undefined {
   return parseProviders(value);
+}
+
+export function parseProviderSoftRateLimitsForTest(value: unknown): ProviderSoftRateLimitConfig | undefined {
+  return parseProviderSoftRateLimits(value);
+}
+
+function parseProviderSoftRateLimits(value: unknown): ProviderSoftRateLimitConfig | undefined {
+  if (!isObject(value)) return undefined;
+  const rpm = readPositiveInteger((value as Record<string, unknown>).rpm ?? (value as Record<string, unknown>).RPM ?? (value as Record<string, unknown>).requestsPerMinute);
+  const tpm = readPositiveInteger((value as Record<string, unknown>).tpm ?? (value as Record<string, unknown>).TPM ?? (value as Record<string, unknown>).tokensPerMinute);
+  const clamped: ProviderSoftRateLimitConfig = {
+    ...(rpm !== undefined ? { rpm: clampNumber(rpm, 1, 100000) } : {}),
+    ...(tpm !== undefined ? { tpm: clampNumber(tpm, 1, 10000000) } : {})
+  };
+  return Object.keys(clamped).length > 0 ? clamped : undefined;
 }
 
 function hasUnsupportedNvidiaCapabilities(value: unknown): boolean {
@@ -1465,6 +1481,7 @@ function parseProviders(value: unknown): GatewayProviderConfig[] | undefined {
         name,
         provider: readString(item.provider),
         protocolDetectionMode: parseEnumValue(item.protocolDetectionMode, ["auto", "manual"], undefined),
+        softRateLimits: parseProviderSoftRateLimits(item.softRateLimits ?? item.soft_rate_limits),
         transformer: item.transformer,
         type: readString(item.type)
       };

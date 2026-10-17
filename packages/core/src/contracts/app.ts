@@ -157,6 +157,11 @@ export type GatewayMediaProtocol =
 
 export type GatewayProviderCapabilityProtocol = GatewayProviderProtocol | GatewayMediaProtocol;
 
+export type ProviderSoftRateLimitConfig = {
+  rpm?: number;
+  tpm?: number;
+};
+
 export type GatewayProviderConfig = {
   account?: ProviderAccountConfig;
   api_base_url?: string;
@@ -182,6 +187,7 @@ export type GatewayProviderConfig = {
   name: string;
   provider?: string;
   protocolDetectionMode?: "auto" | "manual";
+  softRateLimits?: ProviderSoftRateLimitConfig;
   transformer?: unknown;
   type?: GatewayProviderProtocol | string;
 };

@@ -164,11 +164,13 @@ test("raw trace bundle preserves manifest lifecycle metadata", async () => {
   const spoolDirectory = path.join(dir, "spool");
   const bundleDirectory = path.join(spoolDirectory, "producer-bundle");
   const clientMetadataFile = path.join(bundleDirectory, "client_request_metadata.json");
+  const upstreamMetadataFile = path.join(bundleDirectory, "upstream_request_metadata.json");
   const bodyFile = path.join(bundleDirectory, "upstream_request.json");
   const startedAt = "2026-08-26T01:02:03.004Z";
   const completedAt = "2026-08-26T01:02:04.238Z";
   mkdirSync(bundleDirectory, { recursive: true });
   writeFileSync(clientMetadataFile, JSON.stringify({ headers: { "x-ccr-client": "opencode" } }));
+  writeFileSync(upstreamMetadataFile, JSON.stringify({ headers: { "x-client-request-id": "gateway-request-uuid" }, method: "POST", url: "https://provider.example/v1/chat/completions" }));
   writeFileSync(bodyFile, "{}");
   try {
     const bundle = await readRawTraceRequestLogBundle({
@@ -177,6 +179,9 @@ test("raw trace bundle preserves manifest lifecycle metadata", async () => {
       parts: [{
         filePath: clientMetadataFile,
         partType: "client_request_metadata"
+      }, {
+        filePath: upstreamMetadataFile,
+        partType: "upstream_request_metadata"
       }, {
         contentType: "application/json",
         filePath: bodyFile,
@@ -190,12 +195,35 @@ test("raw trace bundle preserves manifest lifecycle metadata", async () => {
     }, spoolDirectory);
 
     assert.ok(bundle);
-    assert.equal(bundle.update.requestId, "logical-lifecycle-request");
+    assert.equal(bundle.update.requestId, "gateway-request-uuid");
+    assert.equal(bundle.update.bundleId, "core-bundle-lifecycle");
     assert.equal(bundle.update.client, "opencode");
     assert.equal(bundle.update.startedAt, startedAt);
     assert.equal(bundle.update.completedAt, completedAt);
     assert.equal(bundle.update.durationMs, 1234);
     assert.equal(bundle.update.bundleCapturedAt, completedAt);
+
+    writeFileSync(upstreamMetadataFile, JSON.stringify({ headers: { "x-client-request-id": "gateway-request-uuid-2" }, method: "POST", url: "https://provider.example/v1/chat/completions" }));
+    const secondBundle = await readRawTraceRequestLogBundle({
+      completedAt,
+      durationMs: 900,
+      parts: [{
+        filePath: upstreamMetadataFile,
+        partType: "upstream_request_metadata"
+      }, {
+        contentType: "application/json",
+        filePath: bodyFile,
+        originalBytes: 2,
+        partType: "upstream_request"
+      }],
+      requestId: "core-bundle-lifecycle-2",
+      startedAt,
+      turnKey: "logical-lifecycle-request",
+      uploadedAt: completedAt
+    }, spoolDirectory);
+    assert.ok(secondBundle);
+    assert.equal(secondBundle.update.requestId, "gateway-request-uuid-2");
+    assert.equal(secondBundle.update.requestId === bundle.update.requestId, false);
   } finally {
     rmSync(dir, { force: true, recursive: true });
   }

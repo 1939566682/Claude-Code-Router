@@ -354,7 +354,18 @@ type ToolCallStreamState = {
 const maxBodyBytes = maxRequestLogBodyBytes;
 const requestLogInlineBodyBytes = 160 * 1024;
 const requestLogBodyChunkMaxBytes = 1024 * 1024;
+// 自动清理：容量 512MB + 时间 14 天双控。1GB 拍脑袋过大，C 盘仅剩 40G 时 1GB 日志会挤占系统盘；
+// 实测 421 条记录约 430MB（含 bodies 191MB），重度日用约 50-100 请求/天 ≈ 50-100MB/天，
+// 512MB 可保 5-10 天可回溯，14 天保调试窗口，容量与时间谁先到就删谁。
+const maxRetainedRequestLogBytes = 512 * 1024 * 1024;
+const requestLogRetentionCleanupIntervalMs = 5 * 60 * 1_000;
+const requestLogRetentionDeleteBatchSize = 500;
+const requestLogRetentionDays = 14;
 const maxAgentAnalysisRows = 5000;
+// Analysis only needs a bounded excerpt to classify a request and build previews.
+// Full request/response bodies remain in the body store for explicit detail reads.
+const maxAgentAnalysisBodyChars = 2048;
+const maxAgentAnalysisItemsPerRequest = 8;
 const maxTracePayloadPreviewChars = 1600;
 const maxPendingRawTraceEntries = 200;
 const maxPendingRawTraceEntryBytes = 2 * 1024 * 1024;
@@ -418,15 +429,23 @@ export class RequestLogStore {
   private insertRequestStatement?: BetterSqliteStatement;
   private insertRouteTraceStatement?: BetterSqliteStatement;
   private lastRetentionCleanupDay?: string;
+  private lastCapacityCleanupAt = 0;
   private revision = 0;
+  private readonly retentionLimitBytes: number;
+  private readonly retentionCleanupIntervalMs: number;
   private analysisCache?: AgentAnalysisCacheEntry;
 
   constructor(
     private readonly dbFile: string,
     private readonly bodyDir = dbFile === REQUEST_LOGS_DB_FILE
       ? REQUEST_LOG_BODIES_DIR
-      : join(dirname(dbFile), "request-log-bodies")
-  ) {}
+      : join(dirname(dbFile), "request-log-bodies"),
+    retentionLimitBytes = maxRetainedRequestLogBytes,
+    retentionCleanupIntervalMs = requestLogRetentionCleanupIntervalMs
+  ) {
+    this.retentionLimitBytes = clampInteger(retentionLimitBytes, 1, Number.MAX_SAFE_INTEGER, maxRetainedRequestLogBytes);
+    this.retentionCleanupIntervalMs = clampInteger(retentionCleanupIntervalMs, 0, Number.MAX_SAFE_INTEGER, requestLogRetentionCleanupIntervalMs);
+  }
 
   async initialize(): Promise<void> {
     await this.getDatabase();
@@ -582,10 +601,13 @@ export class RequestLogStore {
     const rawResponseHeaders = headersToRecord(input.responseHeaders);
     const requestHeaders = sanitizeHeaders(rawRequestHeaders);
     const responseHeaders = sanitizeHeaders(rawResponseHeaders);
-    const responseBodyText = input.responseBodyText ?? "";
+    const rawResponseBodyText = input.responseBodyText ?? "";
+    // 在 errors 策略下，responseBodyText 可能已被上游截断为 ""，但 usage 仍需从原始
+    // body 解析；先用原始值算 usage，再决定持久化时是否剥离正文。
     const responseError = normalizeFilterValue(input.error) ??
-      detectSseError(responseBodyText, headerValue(responseHeaders, "content-type"));
-    const bodyUsage = extractUsageFromBody(responseBodyText);
+      detectSseError(rawResponseBodyText, headerValue(responseHeaders, "content-type"));
+    const isSuccessful = isSuccessStatus(input.statusCode, responseError);
+    const bodyUsage = extractUsageFromBody(rawResponseBodyText);
     // Each source carries its own cache-inclusion convention; normalize before
     // merging (see UsageConventionSource).
     const usage: UsageSnapshot = mergeUsageSnapshots(
@@ -613,7 +635,7 @@ export class RequestLogStore {
       normalizeFilterValue(input.fallbackModel) ??
       "";
     const responseModel = normalizeFilterValue(input.responseModel) ??
-      requestLogResponseModel(responseBodyText) ??
+      requestLogResponseModel(rawResponseBodyText) ??
       "";
     const provider =
       normalizeFilterValue(input.providerName) ??
@@ -661,23 +683,32 @@ export class RequestLogStore {
       sizeBytes: Math.max(capturedRequestBody.sizeBytes, normalizeCount(input.requestBodySizeBytes)),
       truncated: capturedRequestBody.truncated || Boolean(input.requestBodyTruncated)
     };
+    // 用户规则：请求正文/请求头永不落盘；响应正文仅当 HTTP 非 2xx-3xx 才保留（便于排障），否则只留元数据+用量。
+    // isSuccessful 已基于 statusCode + SSE error 判定，200-399 且无 error 即为成功。
+    const shouldPersistResponseBody = !isSuccessful;
+    const requestBodyForPersist = { ...requestBody, text: "", bodyRef: undefined, sizeBytes: 0, truncated: false } as typeof requestBody;
+    const rawResponseBodyForPersist = shouldPersistResponseBody ? rawResponseBodyText : "";
     const responseBody = bodyFromText(
-      responseBodyText,
+      rawResponseBodyForPersist,
       headerValue(responseHeaders, "content-type"),
-      Boolean(input.responseBodyTruncated),
-      input.responseBodySizeBytes,
+      shouldPersistResponseBody ? Boolean(input.responseBodyTruncated) : false,
+      shouldPersistResponseBody ? input.responseBodySizeBytes : 0,
       undefined,
       { bodyDir: this.bodyDir, side: "response" }
     );
+    // 流式判定仅依赖 path/url 与 responseHeaders/响应体类型，不依赖已清空的请求正文/头
     const isStream = inferRequestLogIsStream({
       path: input.path,
-      requestBodyText: requestBody.encoding === "utf8" ? requestBody.text : undefined,
-      requestHeaders,
+      requestBodyText: undefined,
+      requestHeaders: {},
       responseBodyContentType: responseBody.contentType,
       responseHeaders,
       url: input.url
     });
     const streamMetrics = resolveStoredStreamMetrics(input.streamMetrics, outputTokens, reasoningTokens);
+    // 成功请求不保留任何请求头/响应头（只留用量与状态），失败请求保留响应头便于排障
+    const requestHeadersForPersist: Record<string,string|string[]> = {};
+    const responseHeadersForPersist = isSuccessful ? {} as Record<string,string|string[]> : responseHeaders;
 
     const statement = this.insertRequestStatement ??= database.prepare(`
       INSERT OR IGNORE INTO request_logs (
@@ -767,14 +798,14 @@ export class RequestLogStore {
         totalTokens,
         cost?.amountUsd ?? null,
         input.pricing ? JSON.stringify(input.pricing) : "",
-        JSON.stringify(requestHeaders),
-        JSON.stringify(responseHeaders),
-        requestBody.text,
-        requestBody.encoding,
-        requestBody.contentType ?? "",
-        requestBody.sizeBytes,
-        requestBody.truncated ? 1 : 0,
-        requestBody.bodyRef ?? "",
+        JSON.stringify(requestHeadersForPersist),
+        JSON.stringify(responseHeadersForPersist),
+        requestBodyForPersist.text,
+        requestBodyForPersist.encoding,
+        requestBodyForPersist.contentType ?? "",
+        requestBodyForPersist.sizeBytes,
+        requestBodyForPersist.truncated ? 1 : 0,
+        requestBodyForPersist.bodyRef ?? "",
         responseBody.text,
         responseBody.encoding,
         responseBody.contentType ?? "",
@@ -860,6 +891,22 @@ export class RequestLogStore {
     const rawHttpFailure = rawStatusCode !== undefined && rawStatusCode > 0 &&
       (rawStatusCode < 200 || rawStatusCode >= 400);
     const finalSuccessful = !existingFailure && !rawHttpFailure && !rawSseError;
+    const existingUsageContext = readRequestLogUsageContext(database, requestId);
+    const usagePathEarly = normalizeFilterValue(rawInput.path) ?? pathFromUrl(normalizeFilterValue(rawInput.url)) ?? normalizeFilterValue(rawInput.path) ?? existingUsageContext.path;
+    // 先基于原始 rawInput 抽用量，再决定是否抑制正文落盘；否则成功请求的用量会被清空为 0
+    const preCaptureBodyUsage = rawInput.responseBodyText === undefined
+      ? undefined
+      : extractUsageFromBody(rawInput.responseBodyText);
+    const preCaptureUsage: UsageSnapshot | undefined = mergeUsageSnapshots(
+      normalizeUsageInputTokens(extractUsageFromBillingHeaders(rawResponseHeaders), {
+        path: usagePathEarly,
+        source: "providerBilling"
+      }),
+      normalizeUsageInputTokens(preCaptureBodyUsage, {
+        path: usagePathEarly,
+        source: "responseBody"
+      })
+    ) ?? undefined;
     const captureResolution = applyRawTraceBodyCapturePolicy(
       rawInput,
       finalSuccessful
@@ -868,7 +915,6 @@ export class RequestLogStore {
       deleteRequestLogBodyRefs(this.bodyDir, bodyRefsFromRawTraceInput(rawInput));
     }
     const input = captureResolution.input;
-    const existingUsageContext = readRequestLogUsageContext(database, requestId);
 
     const sets: string[] = [];
     const params: SqlValue[] = [];
@@ -922,9 +968,8 @@ export class RequestLogStore {
         pushValue("ok", 0);
       }
     }
-    if (mergedRequestHeaders) {
-      pushValue("request_headers", JSON.stringify(mergedRequestHeaders));
-    }
+    // 本次需求：成功请求永不保留请求头，RawTrace 的 request_headers 不回填已落库的 header
+    // 避免把脱敏前的 header 重新写回，也避免无意义的体积增长
     // The gateway already wrote the authoritative merged response headers
     // (including x-ccr-fallback-attempts, which powers the R{n} retry badge)
     // when it inserted this row. Raw-trace only refines rows that already exist
@@ -932,10 +977,10 @@ export class RequestLogStore {
     // gateway headers — and an empty upstream header set would wipe them to "{}".
     // Keep the incoming set for usage/billing extraction below, but do not
     // persist it to the response_headers column.
-    if (input.responseBodyText !== undefined || responseHeaders) {
+    if (input.responseBodyText !== undefined || responseHeaders || preCaptureUsage) {
       const bodyUsage = input.responseBodyText === undefined
-        ? undefined
-        : extractUsageFromBody(input.responseBodyText);
+        ? preCaptureUsage
+        : (extractUsageFromBody(input.responseBodyText) ?? preCaptureUsage);
       // As in record(), each source is normalized under its own convention.
       // Raw-trace updates carry no provider protocol — it is not part of the
       // gateway's raw-trace sync contract — so the billing headers fall back to
@@ -1015,20 +1060,9 @@ export class RequestLogStore {
         url
       }) ? 1 : 0);
     }
-    const shouldApplyRequestBody = input.requestBodyText !== undefined ||
-      Boolean(input.requestBodyRef && (!input.requestBodyTruncated || !existingOutcome.hasRequestBody));
-    if (shouldApplyRequestBody && (
-      captureResolution.bodiesSuppressed || Boolean(input.requestBodyRef) || (input.requestBodyText?.length ?? 0) > 0 || !existingOutcome.hasRequestBody
-    )) {
-      const requestBody = bodyFromText(
-        input.requestBodyText ?? "",
-        input.requestBodyContentType ?? headerValue(mergedRequestHeaders ?? {}, "content-type"),
-        Boolean(input.requestBodyTruncated),
-        input.requestBodySizeBytes,
-        rawTraceHardMaxBodyBytes,
-        { bodyDir: this.bodyDir, bodyRef: input.requestBodyRef, side: "request" }
-      );
-      pushBodyValues(sets, params, "request", requestBody);
+    // 新规则：请求正文永不通过 RawTrace 回填（成功/失败都不留），避免 bodies 体积反弹；仅保留用量
+    if (input.requestBodyRef) {
+      deleteRequestLogBodyRefs(this.bodyDir, [input.requestBodyRef]);
     }
     const preserveExistingResponseBody = shouldPreserveExistingResponseBodyForRawTrace(
       existingOutcome,
@@ -1037,13 +1071,12 @@ export class RequestLogStore {
       responseBodyContentType,
       sseError
     );
-    const shouldApplyResponseBody = !preserveExistingResponseBody && (
+    // 响应正文：仅当最终为失败（非 2xx-3xx 或 SSE error）才回填；成功请求丢弃响应体
+    const shouldApplyResponseBody = !finalSuccessful && !preserveExistingResponseBody && (
       input.responseBodyText !== undefined ||
       Boolean(input.responseBodyRef && (!input.responseBodyTruncated || !existingOutcome.hasResponseBody))
     );
-    if (shouldApplyResponseBody && (
-      captureResolution.bodiesSuppressed || Boolean(input.responseBodyRef) || (input.responseBodyText?.length ?? 0) > 0 || !existingOutcome.hasResponseBody
-    )) {
+    if (shouldApplyResponseBody) {
       const responseBody = bodyFromText(
         input.responseBodyText ?? "",
         responseBodyContentType,
@@ -1053,7 +1086,7 @@ export class RequestLogStore {
         { bodyDir: this.bodyDir, bodyRef: input.responseBodyRef, side: "response" }
       );
       pushBodyValues(sets, params, "response", responseBody);
-    } else if (preserveExistingResponseBody && input.responseBodyRef) {
+    } else if (input.responseBodyRef) {
       deleteRequestLogBodyRefs(this.bodyDir, [input.responseBodyRef]);
     }
 
@@ -1072,7 +1105,7 @@ export class RequestLogStore {
 
   async list(filter: RequestLogListFilter = {}): Promise<RequestLogPage> {
     const database = await this.getDatabase();
-    this.pruneOldRequestLogs(database);
+    this.pruneOldRequestLogs(database, true);
     const pageSize = clampInteger(filter.pageSize, 1, 100, 25);
     const page = clampInteger(filter.page, 1, Number.MAX_SAFE_INTEGER, 1);
     const query = buildLogWhereClause(filter);
@@ -1280,17 +1313,30 @@ export class RequestLogStore {
             cost_usd,
             request_headers,
             response_headers,
-            request_body_text,
+            CASE
+              WHEN request_body_ref <> '' OR length(request_body_text) > ${maxAgentAnalysisBodyChars} THEN ''
+              ELSE request_body_text
+            END AS request_body_text,
             request_body_encoding,
             request_body_content_type,
             request_body_size_bytes,
-            request_body_truncated,
+            CASE
+              WHEN request_body_ref <> '' OR length(request_body_text) > ${maxAgentAnalysisBodyChars} THEN 1
+              ELSE request_body_truncated
+            END AS request_body_truncated,
             request_body_ref,
-            response_body_text,
+            CASE
+              WHEN response_body_ref <> '' OR length(response_body_text) > ${maxAgentAnalysisBodyChars} THEN ''
+              ELSE response_body_text
+            END AS response_body_text,
             response_body_encoding,
             response_body_content_type,
             response_body_size_bytes,
-            response_body_truncated,
+            CASE
+              WHEN response_body_ref <> '' AND response_body_text <> '' THEN 1
+              WHEN length(response_body_text) > ${maxAgentAnalysisBodyChars} THEN 1
+              ELSE response_body_truncated
+            END AS response_body_truncated,
             response_body_ref,
             error
           FROM request_logs
@@ -1519,53 +1565,104 @@ export class RequestLogStore {
       WHERE event_id <> '';
     `);
     backfillRequestLogStreamFlags(database);
+    // Historical backfills disabled: per user request, keep ONLY live per-request logging.
+    // The 3 heavy migrations (raw-trace orphans / cost JOIN / sessions scan) stall the
+    // main thread on first launch and cause the diy Electron to appear frozen / crash.
+    // They are intentionally not run; live logging is handled by readRawTraceRequestLogBundle
+    // (bundleId = requestId || turnKey -> per-bundle unique) alone.
 
     this.database = database;
     this.pruneOldRequestLogs(database);
     return database;
   }
 
-  private pruneOldRequestLogs(database: SqlDatabase): void {
+  private pruneOldRequestLogs(database: SqlDatabase, forceCapacityCleanup = false): void {
     const now = new Date();
     const dayKey = formatLocalDayKey(now);
-    if (this.lastRetentionCleanupDay === dayKey) {
-      return;
-    }
-    pruneRawTraceEvents(database, now.getTime());
-
-    const cutoff = floorDay(now).toISOString();
-    const staleCount = firstNumber(
-      queryRows(
-        database,
-        "SELECT COUNT(*) AS total FROM request_logs WHERE source_usage_id IS NULL AND created_at < ?",
-        [cutoff]
-      ),
-      "total"
-    );
-
-    if (staleCount === 0) {
+    if (this.lastRetentionCleanupDay !== dayKey) {
+      pruneRawTraceEvents(database, now.getTime());
+      const cutoff = new Date(now.getTime() - requestLogRetentionDays * 24 * 60 * 60 * 1_000).toISOString();
+      const staleCount = firstNumber(
+        queryRows(
+          database,
+          "SELECT COUNT(*) AS total FROM request_logs WHERE source_usage_id IS NULL AND created_at < ?",
+          [cutoff]
+        ),
+        "total"
+      );
+      if (staleCount > 0) {
+        const refs = queryRows(
+          database,
+          `
+            SELECT request_body_ref, response_body_ref
+            FROM request_logs
+            WHERE source_usage_id IS NULL AND created_at < ?
+          `,
+          [cutoff]
+        ).flatMap((row) => [
+          normalizeFilterValue(String(row.request_body_ref ?? "")),
+          normalizeFilterValue(String(row.response_body_ref ?? ""))
+        ]).filter((value): value is string => Boolean(value));
+        database.prepare(
+          "DELETE FROM request_logs WHERE source_usage_id IS NULL AND created_at < ?"
+        ).run(cutoff);
+        deleteRequestLogBodyRefs(this.bodyDir, refs);
+      }
       this.lastRetentionCleanupDay = dayKey;
-      return;
     }
 
-    const refs = queryRows(
+    const nowMs = now.getTime();
+    if (!forceCapacityCleanup && nowMs - this.lastCapacityCleanupAt < this.retentionCleanupIntervalMs) return;
+    this.lastCapacityCleanupAt = nowMs;
+    // 容量统计：优先用 size_bytes，兜底用 body 文件实际大小（兼容 maxBodyBytes=0 时 size_bytes 记 0 的历史数据）。
+    let totalBytes = firstNumber(queryRows(
       database,
-      `
-        SELECT request_body_ref, response_body_ref
-        FROM request_logs
-        WHERE source_usage_id IS NULL AND created_at < ?
-      `,
-      [cutoff]
-    ).flatMap((row) => [
-      normalizeFilterValue(String(row.request_body_ref ?? "")),
-      normalizeFilterValue(String(row.response_body_ref ?? ""))
-    ]).filter((value): value is string => Boolean(value));
-
-    database.prepare(
-      "DELETE FROM request_logs WHERE source_usage_id IS NULL AND created_at < ?",
-    ).run(cutoff);
-    deleteRequestLogBodyRefs(this.bodyDir, refs);
-    this.lastRetentionCleanupDay = dayKey;
+      "SELECT COALESCE(SUM(request_body_size_bytes + response_body_size_bytes), 0) AS total FROM request_logs WHERE source_usage_id IS NULL"
+    ), "total");
+    // 如果 DB 统计为 0 但实际有 body 文件，回退到估算：每条有 ref 的按 bodies 目录平均推算，避免永远不触发清理
+    if (totalBytes === 0) {
+      const withRef = firstNumber(queryRows(
+        database,
+        "SELECT COUNT(*) AS c FROM request_logs WHERE source_usage_id IS NULL AND (request_body_ref <> '' OR response_body_ref <> '')"
+      ), "c");
+      // 每条估算 200KB（实测 421 条 191MB bodies ≈ 460KB/条，保守取 200KB 避免过度清理）
+      totalBytes = withRef * 200 * 1024;
+    }
+    let excess = totalBytes - this.retentionLimitBytes;
+    while (excess > 0) {
+      const batch = queryRows(
+        database,
+        `
+          SELECT id, request_body_ref, response_body_ref, request_body_size_bytes, response_body_size_bytes
+          FROM request_logs
+          WHERE source_usage_id IS NULL
+          ORDER BY created_at ASC, id ASC
+          LIMIT ?
+        `,
+        [requestLogRetentionDeleteBatchSize]
+      );
+      if (batch.length === 0) break;
+      let batchBytes = 0;
+      for (const row of batch) {
+        const raw = normalizeCount(row.request_body_size_bytes) + normalizeCount(row.response_body_size_bytes);
+        // size_bytes 为 0 但有 ref 的，按估算 200KB/条兜底，避免 batchBytes=0 导致死循环 break
+        const hasRef = Boolean(String(row.request_body_ref ?? "").trim() || String(row.response_body_ref ?? "").trim());
+        batchBytes += raw > 0 ? raw : (hasRef ? 200 * 1024 : 0);
+      }
+      if (totalBytes > this.retentionLimitBytes && batchBytes === 0) break;
+      const ids = batch.map((row) => normalizeCount(row.id));
+      const refs = batch.flatMap((row) => [
+        normalizeFilterValue(String(row.request_body_ref ?? "")),
+        normalizeFilterValue(String(row.response_body_ref ?? ""))
+      ]).filter((value): value is string => Boolean(value));
+      const placeholders = ids.map(() => "?").join(",");
+      database.prepare(`DELETE FROM request_logs WHERE source_usage_id IS NULL AND id IN (${placeholders})`).run(...ids);
+      deleteRequestLogBodyRefs(this.bodyDir, refs);
+      excess -= batchBytes;
+      if (batchBytes === 0) break;
+    }
+    if (excess > 0) console.warn(`[request-log] Retention could not prune ${excess} over-capacity bytes.`);
+    if (totalBytes > this.retentionLimitBytes && excess < totalBytes - this.retentionLimitBytes) this.revision += 1;
   }
 
   private storePendingRawTraceUpdate(database: SqlDatabase, input: RequestLogRawTraceUpdateInput): void {
@@ -1659,12 +1756,15 @@ function standaloneRecordInputFromRawTrace(
   const rawFailure = (statusCode > 0 && (statusCode < 200 || statusCode >= 400)) ||
     Boolean(detectSseError(responseBodyForOutcome, responseContentType));
   const captureBody = bodyCapturePolicy === "all" || (bodyCapturePolicy === "errors" && rawFailure);
-  const requestBody = captureBody
-    ? rawTraceBodyBuffer(input.requestBodyText, rawTraceFiles?.requestBody, maxBodyBytes)
-    : suppressedRawTraceBody(input.requestBodySizeBytes, input.requestBodyTruncated);
-  const responseBody = captureBody
-    ? rawTraceBodyTextCapture(input.responseBodyText, rawTraceFiles?.responseBody, maxBodyBytes)
-    : suppressedRawTraceBody(input.responseBodySizeBytes, input.responseBodyTruncated);
+  // errors 模式：成功请求不持久化正文（节省体积），但用量仍需从原始响应体解析；
+  // 因此总是先以原文计算 bodyUsage/responseModel，再决定持久化时是否清空正文。
+  // 关键修复：原始 responseBodyText 带有 usage（如 gpt-5.6-sol 的 cached_tokens），
+  // 若直接以 suppressed("") 传入 record()，则 extractUsageFromBody 为空，token 全 0。
+  // 故用量相关字段的解析必须在 suppression 之前完成，持久化再清空。
+  // 成功请求虽不持久化正文，但仍需将原始响应体传入 record() 以便其内部以 rawResponseBodyText 提取用量；
+  // 持久化是否清空由 record() 内部的 shouldPersist* 决定，此处不提前 suppressed。
+  const requestBody = rawTraceBodyBuffer(input.requestBodyText, rawTraceFiles?.requestBody, maxBodyBytes);
+  const responseBody = rawTraceBodyTextCapture(input.responseBodyText, rawTraceFiles?.responseBody, maxBodyBytes);
   const completedAt = normalizeFilterValue(input.completedAt) ??
     normalizeFilterValue(input.bundleCapturedAt) ??
     now;
@@ -2428,10 +2528,28 @@ function parseLogBodyPayloads(body: RequestLogBody | undefined): unknown[] {
 
   const parsed = parseJson(body.text.trim());
   if (parsed !== undefined) {
-    return [parsed];
+    return [boundAnalysisPayload(parsed)];
   }
 
-  return parseStreamPayloads(body.text);
+  return parseStreamPayloads(body.text)
+    .slice(0, maxAgentAnalysisItemsPerRequest)
+    .map(boundAnalysisPayload);
+}
+
+function boundAnalysisPayload(value: unknown, depth = 0): unknown {
+  if (depth >= 12) return "[analysis depth limit]";
+  if (typeof value === "string") return boundedAnalysisText(value).text;
+  if (Array.isArray(value)) {
+    const items = value.slice(0, maxAgentAnalysisItemsPerRequest).map((item) => boundAnalysisPayload(item, depth + 1));
+    if (value.length > items.length) items.push(`[${value.length - items.length} more items]`);
+    return items;
+  }
+  if (!isRecord(value)) return value;
+
+  const entries = Object.entries(value);
+  const bounded = Object.fromEntries(entries.slice(0, 64).map(([key, item]) => [key, boundAnalysisPayload(item, depth + 1)]));
+  if (entries.length > 64) bounded.__ccr_analysis_omitted_keys = entries.length - 64;
+  return bounded;
 }
 
 function extractConversationMessages(
@@ -2632,13 +2750,14 @@ function conversationItemPreview(
   if (!normalized) {
     return undefined;
   }
+  const preview = boundedAnalysisText(normalized);
   return {
-    content: normalized,
+    content: preview.text,
     id,
     role,
     sourcePreview: Boolean(body?.preview),
     sourceTruncated: Boolean(body?.truncated),
-    truncated: false
+    truncated: preview.truncated || Boolean(body?.truncated)
   };
 }
 
@@ -2917,11 +3036,12 @@ function conversationMessagePreview(
   if (!normalized) {
     return undefined;
   }
+  const preview = boundedAnalysisText(normalized);
   return {
-    content: normalized,
+    content: preview.text,
     sourcePreview: Boolean(body?.preview),
     sourceTruncated: Boolean(body?.truncated),
-    truncated: false
+    truncated: preview.truncated || Boolean(body?.truncated)
   };
 }
 
@@ -2929,6 +3049,11 @@ function normalizeConversationText(value: string | undefined): string {
   return (value ?? "")
     .replace(/\r\n/g, "\n")
     .trim();
+}
+
+function boundedAnalysisText(value: string): { text: string; truncated: boolean } {
+  if (value.length <= maxAgentAnalysisBodyChars) return { text: value, truncated: false };
+  return { text: `${value.slice(0, maxAgentAnalysisBodyChars)}\n...`, truncated: true };
 }
 
 function extractToolCalls(payloads: unknown[]): AgentToolCallDetail[] {
@@ -4519,6 +4644,9 @@ function ensureRequestLogSchema(database: SqlDatabase): void {
 const requestLogMigrationBatchSize = 500;
 const gatewayOutcomeMigrationName = "gateway-outcome-v1";
 const gatewayFinalAttemptMigrationName = "gateway-final-attempt-v1";
+const aggregatedCodexBackfillMigrationName = "aggregated-codex-backfill-v1";
+const aggregatedCodexBackfillCostMigrationName = "aggregated-codex-backfill-cost-v1";
+const sessionsCodexBackfillMigrationName = "sessions-codex-backfill-v1";
 
 function ensureRequestLogMigrationSchema(database: SqlDatabase): void {
   database.exec(`
@@ -4644,6 +4772,202 @@ function migrateGatewayFinalAttempt(database: SqlDatabase): void {
     }
   }
 }
+export function migrateAggregatedCodexLogsFixup(..._args: unknown[]): void {
+  // deprecated stub; historical backfills intentionally disabled, live per-request only
+}
+
+export function migrateAggregatedCodexLogs(database: SqlDatabase, bodyDir: string): void {
+  void bodyDir;
+  const state = requestLogMigrationState(database, aggregatedCodexBackfillMigrationName);
+  if (state.completed) return;
+  const rowsAll = database.prepare(
+    "SELECT bundle_id, request_id, processed_at FROM request_log_raw_trace_events WHERE bundle_id <> request_id AND bundle_id NOT IN (SELECT request_id FROM request_logs) AND bundle_id NOT IN (SELECT substr(event_id,11) FROM request_logs WHERE event_id LIKE 'raw-trace:%')"
+  ).all() as Array<{ bundle_id: string; request_id: string; processed_at: number }>;
+  if (rowsAll.length === 0) {
+    completeRequestLogMigration(database, aggregatedCodexBackfillMigrationName, 0);
+    return;
+  }
+  const tplStmt = database.prepare("SELECT * FROM request_logs WHERE request_id = ? LIMIT 1");
+  const fallbackTpl = database.prepare("SELECT * FROM request_logs ORDER BY id DESC LIMIT 1").get() as Record<string, unknown> | undefined;
+  const cols = [
+    "source_usage_id","created_at","completed_at","request_id","event_id","client","method","path","url","provider",
+    "credential_id","credential_chain","credential_saturated","model","requested_model","resolved_model","response_model",
+    "route_trace_version","route_hop_count","route_attempt_count","route_trace_truncated","is_stream","status_code","ok",
+    "gateway_status_code","gateway_ok","gateway_error","gateway_final_attempt","gateway_body_capture_policy","gateway_body_capture_max_bytes",
+    "duration_ms","input_tokens","output_tokens","reasoning_tokens","cache_read_tokens","cache_write_tokens","total_tokens",
+    "cost_usd","pricing_json","request_headers","response_headers","request_body_text","request_body_encoding","request_body_content_type",
+    "request_body_size_bytes","request_body_truncated","request_body_ref","response_body_text","response_body_encoding","response_body_content_type",
+    "response_body_size_bytes","response_body_truncated","response_body_ref","stream_metrics_json","error"
+  ];
+  const placeholders = cols.map(() => "?").join(",");
+  const insertStmt = database.prepare("INSERT OR IGNORE INTO request_logs (" + cols.join(",") + ") VALUES (" + placeholders + ")");
+  let inserted = 0;
+  database.exec("BEGIN IMMEDIATE");
+  try {
+    for (const r of rowsAll) {
+      let tpl: any = tplStmt.get(r.request_id) as any;
+      if (!tpl) tpl = fallbackTpl as any;
+      if (!tpl) continue;
+      const createdAt = new Date(r.processed_at).toISOString();
+      const eventId = "raw-trace:" + r.bundle_id;
+      const exists = database.prepare("SELECT 1 FROM request_logs WHERE request_id = ? OR event_id = ? LIMIT 1").get(r.bundle_id, eventId);
+      if (exists) continue;
+      insertStmt.run(
+        null,
+        createdAt,
+        createdAt,
+        r.bundle_id,
+        eventId,
+        tpl.client, tpl.method, tpl.path, tpl.url, tpl.provider,
+        tpl.credential_id, tpl.credential_chain, tpl.credential_saturated,
+        tpl.model, tpl.requested_model, tpl.resolved_model, tpl.response_model,
+        tpl.route_trace_version, tpl.route_hop_count, tpl.route_attempt_count, tpl.route_trace_truncated,
+        tpl.is_stream, tpl.status_code, tpl.ok,
+        tpl.gateway_status_code, tpl.gateway_ok, tpl.gateway_error, tpl.gateway_final_attempt,
+        tpl.gateway_body_capture_policy, tpl.gateway_body_capture_max_bytes,
+        0, 0, 0, 0, 0, 0, 0,
+        null, tpl.pricing_json, tpl.request_headers, tpl.response_headers,
+        "", tpl.request_body_encoding, tpl.request_body_content_type,
+        0, 0, "",
+        "", tpl.response_body_encoding, tpl.response_body_content_type,
+        0, 0, "",
+        tpl.stream_metrics_json, tpl.error
+      );
+      inserted++;
+    }
+    completeRequestLogMigration(database, aggregatedCodexBackfillMigrationName, inserted);
+    database.exec("COMMIT");
+    if (inserted > 0) console.warn("[request-log] Backfilled " + inserted + " true-codex aggregated rows (sentinel, body-excluded)");
+  } catch (e) {
+    if ((database as any).inTransaction) database.exec("ROLLBACK");
+    throw e;
+  }
+}
+
+export function migrateAggregatedCodexLogsCost(database: SqlDatabase): void {
+  const state = requestLogMigrationState(database, aggregatedCodexBackfillCostMigrationName);
+  if (state.completed) return;
+  let upgraded = 0;
+  try {
+    const usageFile = join(dirname(REQUEST_LOGS_DB_FILE), "usage.sqlite");
+    let attached = false;
+    try { database.exec("ATTACH DATABASE '" + usageFile.replace(/'/g, "''") + "' AS usage_db"); attached = true; } catch {}
+    if (attached) {
+      const rows = database.prepare(
+        "SELECT r.id as rid, u.input_tokens as u_in, u.output_tokens as u_out, u.cache_read_tokens as u_cr, u.cache_write_tokens as u_cw, u.total_tokens as u_tot, u.cost_usd as u_cost FROM request_logs r JOIN usage_db.usage_events u ON u.request_id = r.request_id WHERE r.event_id LIKE 'raw-trace:%' AND (r.input_tokens=0 AND r.cost_usd IS NULL) AND u.request_id<>'' LIMIT 5000"
+      ).all() as Array<{ rid: number; u_in: number; u_out: number; u_cr: number; u_cw: number; u_tot: number; u_cost: number | null }>;
+      const upd = database.prepare("UPDATE request_logs SET input_tokens=?, output_tokens=?, cache_read_tokens=?, cache_write_tokens=?, total_tokens=?, cost_usd=? WHERE id=?");
+      database.exec("BEGIN IMMEDIATE");
+      for (const r of rows) {
+        const tot = Number(r.u_tot) || (Number(r.u_in)||0)+(Number(r.u_out)||0)+(Number(r.u_cr)||0)+(Number(r.u_cw)||0);
+        upd.run(Number(r.u_in)||0, Number(r.u_out)||0, Number(r.u_cr)||0, Number(r.u_cw)||0, tot, r.u_cost ?? null, r.rid);
+        upgraded++;
+      }
+      database.exec("COMMIT");
+      try { database.exec("DETACH DATABASE usage_db"); } catch {}
+      if (upgraded>0) console.warn("[request-log] Upgraded " + upgraded + " sentinels with usage JOIN (true cost)");
+    }
+  } catch (e) {
+    try { if ((database as any).inTransaction) database.exec("ROLLBACK"); } catch {}
+    try { database.exec("DETACH DATABASE usage_db"); } catch {}
+    console.warn("[request-log] cost JOIN skipped: " + String((e as Error)?.message ?? e));
+  }
+  completeRequestLogMigration(database, aggregatedCodexBackfillCostMigrationName, upgraded);
+}
+
+export function migrateSessionsCodexBackfill(database: SqlDatabase, bodyDir: string): void {
+  void bodyDir;
+  const state = requestLogMigrationState(database, sessionsCodexBackfillMigrationName);
+  if (state.completed) return;
+  try {
+    const usageFile = join(dirname(REQUEST_LOGS_DB_FILE), "usage.sqlite");
+    let usageDays = new Set<string>();
+    try {
+      database.exec("ATTACH DATABASE '" + usageFile.replace(/'/g, "''") + "' AS usage_db");
+      const rows = database.prepare("SELECT DISTINCT substr(created_at,1,10) as d FROM usage_db.usage_events").all() as Array<{d:string}>;
+      for(const r of rows) usageDays.add(r.d);
+      database.exec("DETACH DATABASE usage_db");
+    } catch {}
+    const sentinelDays = new Set<string>((database.prepare("SELECT DISTINCT substr(created_at,1,10) as d FROM request_logs WHERE event_id LIKE 'raw-trace:%'").all() as Array<{d:string}>).map(r=>r.d));
+    const coveredDays = new Set<string>([...usageDays, ...sentinelDays]);
+    const sessionsRoot = process.env.CODEX_HOME ? join(process.env.CODEX_HOME, "sessions") : join(process.env.USERPROFILE ?? "", ".codex", "sessions");
+    let inserted = 0;
+    try {
+      const dayGroups = new Map<string, Array<{ ts: string; input: number; output: number; model: string; provider: string }>>();
+      const walk = (dir: string) => {
+        let ents: any[] = [];
+        try { ents = (require("fs") as any).readdirSync(dir, { withFileTypes: true }); } catch { return; }
+        for (const e of ents) {
+          const p = join(dir, e.name);
+          if (e.isDirectory()) walk(p);
+          else if (e.isFile() && p.endsWith(".jsonl")) {
+            try {
+              const text = (require("fs") as any).readFileSync(p, "utf-8");
+              let provFile = "";
+              try{
+                const ml=text.split("\n").find((l:string)=> l.includes('"model_provider"'));
+                if(ml){ provFile=JSON.parse(ml)?.payload?.model_provider ?? ""; }
+              }catch{}
+              for (const line of text.split("\n")) {
+                if (!line || line.indexOf("token_count") === -1) continue;
+                try {
+                  const o = JSON.parse(line);
+                  if (o?.type !== "event_msg" || o?.payload?.type !== "token_count") continue;
+                  const ts: string = o.timestamp ?? "";
+                  const d = ts.slice(0,10);
+                  if (!d || coveredDays.has(d)) continue;
+                  const info: any = o.payload.info ?? {};
+                  const last: any = info.last_token_usage ?? {};
+                  const total: any = info.total_token_usage ?? {};
+                  const model: string = info.model ?? total.model ?? last.model ?? "unknown";
+                  let provLabel = "Unknown";
+                  if (provFile === "claude-code-router") provLabel = "CodeCraft";
+                  else if (provFile === "custom") provLabel = "Custom (pre-CCR)";
+                  else if (provFile === "deepseek") provLabel = "DeepSeek (pre-CCR)";
+                  else provLabel = provFile ? provFile : "Unknown";
+                  if (provLabel === "CodeCraft" && coveredDays.has(d)) continue;
+                  dayGroups.set(d, dayGroups.get(d) ?? []);
+                  dayGroups.get(d)!.push({ ts, input: Number(last.input_tokens ?? total.input_tokens ?? 0)||0, output: Number(last.output_tokens ?? total.output_tokens ?? 0)||0, model, provider: provLabel });
+                } catch {}
+              }
+            } catch {}
+          }
+        }
+      };
+      walk(sessionsRoot);
+      const tpl: any = database.prepare("SELECT * FROM request_logs ORDER BY id DESC LIMIT 1").get();
+      if (tpl && dayGroups.size>0) {
+        const cols = ["source_usage_id","created_at","completed_at","request_id","event_id","client","method","path","url","provider","credential_id","credential_chain","credential_saturated","model","requested_model","resolved_model","response_model","route_trace_version","route_hop_count","route_attempt_count","route_trace_truncated","is_stream","status_code","ok","gateway_status_code","gateway_ok","gateway_error","gateway_final_attempt","gateway_body_capture_policy","gateway_body_capture_max_bytes","duration_ms","input_tokens","output_tokens","reasoning_tokens","cache_read_tokens","cache_write_tokens","total_tokens","cost_usd","pricing_json","request_headers","response_headers","request_body_text","request_body_encoding","request_body_content_type","request_body_size_bytes","request_body_truncated","request_body_ref","response_body_text","response_body_encoding","response_body_content_type","response_body_size_bytes","response_body_truncated","response_body_ref","stream_metrics_json","error"];
+        const ins = database.prepare("INSERT OR IGNORE INTO request_logs (" + cols.join(",") + ") VALUES (" + cols.map(() => "?").join(",") + ")");
+        database.exec("BEGIN IMMEDIATE");
+        for (const [d, arr] of dayGroups) {
+          const slice = arr.slice(0, 50);
+          for (let i=0;i<slice.length;i++) {
+            const e = slice[i];
+            const rid = "sessions:" + d + ":" + String(i).padStart(4,"0") + ":" + d.replace(/-/g,"") + String(i).padStart(4,"0");
+            const eid = "sessions:" + rid;
+            const ex = database.prepare("SELECT 1 FROM request_logs WHERE event_id=? LIMIT 1").get(eid);
+            if (ex) continue;
+            const tot = (e.input||0)+(e.output||0);
+            ins.run(null, e.ts || (d+"T12:00:00.000Z"), e.ts || (d+"T12:00:00.000Z"), rid, eid, "Codex","POST","/v1/chat/completions","https://codecraftapi.com/v1/chat/completions", e.provider,"","",0,e.model,e.model,e.model,"",0,0,0,0,1,200,1,200,1,"","",1,"all",0,0,e.input,e.output,0,0,0,tot,null,"","{}","{}","","utf8","",0,0,"","","utf8","",0,0,"","","");
+            inserted++;
+          }
+        }
+        database.exec("COMMIT");
+        if (inserted>0) console.warn("[request-log] Sessions fallback inserted " + inserted + " placeholder rows for " + dayGroups.size + " uncovered days");
+      }
+    } catch (e) {
+      try { if ((database as any).inTransaction) database.exec("ROLLBACK"); } catch {}
+      console.warn("[request-log] sessions fallback skipped: " + String((e as Error)?.message ?? e));
+    }
+    completeRequestLogMigration(database, sessionsCodexBackfillMigrationName, inserted as unknown as number);
+  } catch (e) {
+    console.warn("[request-log] sessions backfill outer: " + String((e as Error)?.message ?? e));
+    completeRequestLogMigration(database, sessionsCodexBackfillMigrationName, 0);
+  }
+}
+
+
 
 function ensureRawTraceEventSchema(database: SqlDatabase): void {
   database.exec(`
@@ -4816,8 +5140,8 @@ function buildLogWhereClause(filter: RequestLogListFilter): { params: SqlValue[]
     params.push(model);
   }
   if (provider) {
-    where.push("provider = ?");
-    params.push(provider);
+    where.push("(provider = ? COLLATE NOCASE OR provider LIKE ? ESCAPE CHAR(92))");
+    params.push(provider, provider.replace("%","\%").replace("_","\_") + "::%" );
   }
   if (credential) {
     where.push("credential_id = ?");
@@ -5319,6 +5643,26 @@ function parseHeaderJson(value: SqlValue): Record<string, string | string[]> {
 }
 
 function readDistinctValues(database: SqlDatabase, column: "credential_id" | "model" | "provider"): string[] {
+  if (column === "provider") {
+    const rows = queryRows(
+      database,
+      `
+        SELECT provider AS raw
+        FROM request_logs
+        WHERE source_usage_id IS NULL AND path NOT LIKE ? AND provider <> '' AND provider <> 'unknown'
+      `,
+      ["%/count_tokens%"]
+    );
+    const seen = new Map<string, string>();
+    for (const r of rows) {
+      const raw = String((r as Record<string, unknown>).raw ?? "").trim();
+      if (!raw) continue;
+      const base = raw.split("::")[0]?.trim() || raw;
+      const key = base.toLowerCase();
+      if (!seen.has(key)) seen.set(key, base);
+    }
+    return Array.from(seen.values()).sort((a,b)=> a.toLowerCase().localeCompare(b.toLowerCase())).slice(0,100);
+  }
   return queryRows(
     database,
       `

@@ -662,7 +662,9 @@ export function createProviderDraftFromDeepLinkPayload(
     providerPlugins: [],
     protocol,
     selectedModels: [],
-    selectedProtocols: uniqueProviderProtocols(preset?.endpoints.flatMap((item) => item.protocols) ?? [protocol])
+    selectedProtocols: uniqueProviderProtocols(preset?.endpoints.flatMap((item) => item.protocols) ?? [protocol]),
+    softRateLimitRpm: "",
+    softRateLimitTpm: ""
   };
 }
 
@@ -759,7 +761,9 @@ export function createProviderDraft(providers: GatewayProviderConfig[]): AddProv
     providerPlugins: [],
     protocol: "openai_chat_completions",
     selectedModels: [],
-    selectedProtocols: []
+    selectedProtocols: [],
+    softRateLimitRpm: "",
+    softRateLimitTpm: ""
   };
 }
 
@@ -793,6 +797,8 @@ export function createProviderDraftFromProvider(provider: GatewayProviderConfig)
     name: provider.name,
     presetId: preset?.id ?? customProviderPresetId,
     protocolDetectionMode: provider.protocolDetectionMode === "manual" ? "manual" : "auto",
+    softRateLimitRpm: provider.softRateLimits?.rpm !== undefined ? String(provider.softRateLimits.rpm) : "",
+    softRateLimitTpm: provider.softRateLimits?.tpm !== undefined ? String(provider.softRateLimits.tpm) : "",
     providerPlugins: [],
     protocol,
     selectedModels: [],
@@ -989,6 +995,29 @@ export function providerCredentialsFromDraft(draft: AddProviderDraft): ProviderC
   }
 
   return credentials;
+}
+
+export function providerSoftRateLimitsFromDraft(
+  draft: Pick<AddProviderDraft, "softRateLimitRpm" | "softRateLimitTpm">
+): GatewayProviderConfig["softRateLimits"] | string {
+  function parsePositiveInt(raw: string): number | undefined | string {
+    const t = raw.trim();
+    if (!t) return undefined;
+    const n = Number(t);
+    if (!Number.isFinite(n) || !Number.isInteger(n) || n <= 0) return `供应商限流（软限流）${t.includes(".") ? "需为整数" : "需为正整数"}`;
+    return Math.trunc(n);
+  }
+  const rpmRaw = parsePositiveInt(draft.softRateLimitRpm);
+  if (typeof rpmRaw === "string") return rpmRaw;
+  const tpmRaw = parsePositiveInt(draft.softRateLimitTpm);
+  if (typeof tpmRaw === "string") return tpmRaw;
+  if (rpmRaw !== undefined && (rpmRaw < 1 || rpmRaw > 100000)) return "RPM 需在 1-100000 之间";
+  if (tpmRaw !== undefined && (tpmRaw < 1 || tpmRaw > 10000000)) return "TPM 需在 1-10000000 之间";
+  if (rpmRaw === undefined && tpmRaw === undefined) return undefined;
+  return {
+    ...(rpmRaw !== undefined ? { rpm: rpmRaw } : {}),
+    ...(tpmRaw !== undefined ? { tpm: tpmRaw } : {})
+  };
 }
 
 export function providerCredentialDraftPatchFromJson(text: string): Partial<AddProviderDraft> | string {

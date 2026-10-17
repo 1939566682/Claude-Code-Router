@@ -9,7 +9,7 @@ import {
   formatLogDateTime, formatLogTokenSummary, formatNetworkRequestRaw, formatNetworkResponseRaw, formatRouteTracePath, formatUsdCost,
   FormattedLogBody,
   isJsonContainer, isLargeLogBody, jsonChildPath, logRequestModel,
-  LogBodyFormatMode, logBodyLargeTextThreshold, logBodyPreviewTextLimit, LogBodyWorkerResponse,
+  LogBodyFormatMode, logBodyLargeTextThreshold, logBodyPreviewTextLimit, logBodyWorkerHardTextLimit, LogBodyWorkerResponse,
   logResolvedRouteModel, logSelectOptions, motion, MoveRight, Network, networkCodeLabel,
   networkExchangeMatchesQuery, networkHeaderRows, networkLifecycleLabel, networkQueryRows, networkRowId, networkSummaryRows,
   Pause, Play, ProxyNetworkBody, ProxyNetworkExchange, ProxyNetworkSnapshot, ProxyStatus,
@@ -18,6 +18,7 @@ import {
   translateOptions, Trash2, useAppNumberLocale, useAppText, useCallback, useEffect, useMemo, useRef,
   useState
 } from "../shared/index";
+import { ErrorBoundary } from "@/components/ui/error-boundary";
 import { TooltipPortal } from "@/components/ui/tooltip";
 type NetworkRequestTab = "body" | "header" | "query" | "raw" | "summary";
 type NetworkResponseTab = "body" | "header" | "raw";
@@ -25,6 +26,8 @@ type NetworkResponseTab = "body" | "header" | "raw";
 const logJsonAutoExpandEntryLimit = 60;
 const logJsonContainerPreviewLimit = 80;
 const logJsonAutoExpandTextLimit = 160 * 1024;
+const logBodyDomTextLimit = 200 * 1024;
+const logJsonMaxDepth = 16;
 const logBodyAutoLoadJsonBytes = 2 * 1024 * 1024;
 const logBodyWorkerFilterDebounceMs = 180;
 type LogTableColumnId = "time" | "status" | "stream" | "model" | "credential" | "tokens" | "duration";
@@ -66,6 +69,7 @@ export function NetworkingView({
   const [responseTab, setResponseTab] = useState<NetworkResponseTab>("body");
   const [query, setQuery] = useState("");
   const [selectedId, setSelectedId] = useState<string>();
+  const [capturePage, setCapturePage] = useState(1);
   const [listHeightPercent, setListHeightPercent] = useState(48);
   const [requestWidthPercent, setRequestWidthPercent] = useState(50);
   const networkBodyRef = useRef<HTMLDivElement>(null);
@@ -75,7 +79,20 @@ export function NetworkingView({
     () => snapshot.items.filter((item) => networkExchangeMatchesQuery(item, normalizedQuery)),
     [normalizedQuery, snapshot.items]
   );
+  const capturePageSize = 50;
+  const capturePageCount = Math.max(1, Math.ceil(captures.length / capturePageSize));
+  const visibleCaptures = useMemo(() => {
+    const start = (capturePage - 1) * capturePageSize;
+    return captures.slice(start, start + capturePageSize);
+  }, [capturePage, captures]);
   const selected = captures.find((item) => item.id === selectedId) ?? captures[0];
+
+  useEffect(() => {
+    setCapturePage(1);
+  }, [normalizedQuery]);
+  useEffect(() => {
+    if (capturePage > capturePageCount) setCapturePage(capturePageCount);
+  }, [capturePage, capturePageCount]);
 
   useEffect(() => {
     if (selectedId && captures.some((item) => item.id === selectedId)) {
@@ -145,24 +162,25 @@ export function NetworkingView({
   }
 
   return (
-    <motion.div
-      animate={{ opacity: 1 }}
-      className="network-view min-w-0"
-      initial={{ opacity: 0 }}
-      transition={{ duration: 0.15 }}
-    >
-      <div className="network-shell flex min-h-0 flex-col overflow-hidden rounded-lg border">
-        <div className="network-toolbar flex h-10 min-w-0 shrink-0 items-center gap-2 border-b px-3 max-[720px]:h-auto max-[720px]:flex-wrap max-[720px]:py-2">
-          <div className="relative min-w-[220px] flex-1 max-[720px]:min-w-0 max-[720px]:basis-full">
-            <Search className="network-search-icon pointer-events-none absolute left-2.5 top-1/2 z-[1] h-3.5 w-3.5 -translate-y-1/2" />
-            <input
-              aria-label={t("Search network captures")}
-              className="network-filter-input h-7 w-full rounded-md border pl-8 pr-2 text-[12px] font-semibold outline-none"
-              onChange={(event) => setQuery(event.target.value)}
-              placeholder={t("Filter")}
-              value={query}
-            />
-          </div>
+    <ErrorBoundary fallbackTitle="网络抓包视图渲染失败">
+      <motion.div
+        animate={{ opacity: 1 }}
+        className="network-view min-w-0"
+        initial={{ opacity: 0 }}
+        transition={{ duration: 0.15 }}
+      >
+        <div className="network-shell flex min-h-0 flex-col overflow-hidden rounded-lg border">
+          <div className="network-toolbar flex h-10 min-w-0 shrink-0 items-center gap-2 border-b px-3 max-[720px]:h-auto max-[720px]:flex-wrap max-[720px]:py-2">
+            <div className="relative min-w-[220px] flex-1 max-[720px]:min-w-0 max-[720px]:basis-full">
+              <Search className="network-search-icon pointer-events-none absolute left-2.5 top-1/2 z-[1] h-3.5 w-3.5 -translate-y-1/2" />
+              <input
+                aria-label={t("Search network captures")}
+                className="network-filter-input h-7 w-full rounded-md border pl-8 pr-2 text-[12px] font-semibold outline-none"
+                onChange={(event) => setQuery(event.target.value)}
+                placeholder={t("Filter")}
+                value={query}
+              />
+            </div>
           <span className={cn(
             "rounded-full px-2 py-0.5 text-[11px] font-semibold uppercase",
             proxyStatus.state === "running" ? "network-service-running" : "network-service-muted"
@@ -199,15 +217,23 @@ export function NetworkingView({
             style={{ flex: selected ? `0 0 ${listHeightPercent}%` : "1 1 auto" }}
           >
             <div className="grid gap-2 p-2 min-[721px]:hidden">
-              {captures.map((item, index) => (
-                <NetworkCaptureCard
+              {capturePageCount > 1 ? (
+                <div className="network-body-meta flex items-center justify-center gap-2 border-b pb-2 text-[11px]">
+                  <button className="network-control-button rounded border px-2 py-1 disabled:opacity-40" disabled={capturePage <= 1} onClick={() => setCapturePage((page) => Math.max(1, page - 1))} type="button">{t("Previous")}</button>
+                  <span>{(capturePage - 1) * capturePageSize + 1}-{Math.min(captures.length, capturePage * capturePageSize)} / {captures.length}</span>
+                  <button className="network-control-button rounded border px-2 py-1 disabled:opacity-40" disabled={capturePage >= capturePageCount} onClick={() => setCapturePage((page) => Math.min(capturePageCount, page + 1))} type="button">{t("Next")}</button>
+                </div>
+              ) : null}
+              {visibleCaptures.map((item, pageIndex) => {
+                const index = (capturePage - 1) * capturePageSize + pageIndex;
+                return <NetworkCaptureCard
                   exchange={item}
                   key={item.id}
                   onSelect={() => setSelectedId(item.id)}
                   rowId={networkRowId(item, index, captures.length)}
                   selected={selected?.id === item.id}
-                />
-              ))}
+                />;
+              })}
             </div>
             <div className="min-w-[1180px] max-[720px]:hidden">
               <div className="network-table-header sticky top-0 z-10 grid h-9 grid-cols-[34px_64px_minmax(460px,1fr)_220px_104px_116px_88px] items-center border-b text-[12px] font-semibold">
@@ -228,30 +254,40 @@ export function NetworkingView({
                 </div>
               ) : null}
 
-              {captures.map((item, index) => (
-                <button
-                  className={cn(
-                    "network-row grid h-9 w-full grid-cols-[34px_64px_minmax(460px,1fr)_220px_104px_116px_88px] items-center border-0 px-0 text-left text-[12px] font-semibold outline-none transition-colors",
-                    index % 2 === 0 ? "network-row-even" : "network-row-odd",
-                    selected?.id === item.id && "network-row-selected"
-                  )}
-                  key={item.id}
-                  onClick={() => setSelectedId(item.id)}
-                  type="button"
-                >
-                  <div className="flex justify-center">
-                    <NetworkStatusDot exchange={item} />
-                  </div>
-                  <div className="network-row-id truncate px-2 text-right">{networkRowId(item, index, captures.length)}</div>
-                  <div className="truncate px-2" title={item.url}>{item.url}</div>
-                  <div className="min-w-0 px-2">
-                    <NetworkClientCell client={item.client} />
-                  </div>
-                  <div className="network-row-secondary truncate px-2">{item.method}</div>
-                  <div className="network-row-secondary truncate px-2">{networkLifecycleLabel(item)}</div>
-                  <div className="network-row-secondary truncate px-2">{networkCodeLabel(item)}</div>
-                </button>
-              ))}
+              {visibleCaptures.map((item, pageIndex) => {
+                const index = (capturePage - 1) * capturePageSize + pageIndex;
+                return (
+                  <button
+                    className={cn(
+                      "network-row grid h-9 w-full grid-cols-[34px_64px_minmax(460px,1fr)_220px_104px_116px_88px] items-center border-0 px-0 text-left text-[12px] font-semibold outline-none transition-colors",
+                      index % 2 === 0 ? "network-row-even" : "network-row-odd",
+                      selected?.id === item.id && "network-row-selected"
+                    )}
+                    key={item.id}
+                    onClick={() => setSelectedId(item.id)}
+                    type="button"
+                  >
+                    <div className="flex justify-center">
+                      <NetworkStatusDot exchange={item} />
+                    </div>
+                    <div className="network-row-id truncate px-2 text-right">{networkRowId(item, index, captures.length)}</div>
+                    <div className="truncate px-2" title={item.url}>{item.url}</div>
+                    <div className="min-w-0 px-2">
+                      <NetworkClientCell client={item.client} />
+                    </div>
+                    <div className="network-row-secondary truncate px-2">{item.method}</div>
+                    <div className="network-row-secondary truncate px-2">{networkLifecycleLabel(item)}</div>
+                    <div className="network-row-secondary truncate px-2">{networkCodeLabel(item)}</div>
+                  </button>
+                );
+              })}
+              {capturePageCount > 1 ? (
+                <div className="network-body-meta flex items-center justify-center gap-2 border-t px-3 py-2 text-[11px]">
+                  <button aria-label={t("Previous page")} className="network-control-button rounded border px-2 py-1 disabled:opacity-40" disabled={capturePage <= 1} onClick={() => setCapturePage((page) => Math.max(1, page - 1))} type="button">{t("Previous")}</button>
+                  <span>{(capturePage - 1) * capturePageSize + 1}-{Math.min(captures.length, capturePage * capturePageSize)} / {captures.length}</span>
+                  <button aria-label={t("Next page")} className="network-control-button rounded border px-2 py-1 disabled:opacity-40" disabled={capturePage >= capturePageCount} onClick={() => setCapturePage((page) => Math.min(capturePageCount, page + 1))} type="button">{t("Next")}</button>
+                </div>
+              ) : null}
             </div>
           </div>
 
@@ -300,7 +336,8 @@ export function NetworkingView({
           ) : null}
         </div>
       </div>
-    </motion.div>
+      </motion.div>
+    </ErrorBoundary>
   );
 }
 
@@ -503,20 +540,21 @@ export function LogsView({
   }
 
   return (
-    <motion.div
-      animate={{ opacity: 1 }}
-      className="network-view min-w-0"
-      initial={{ opacity: 0 }}
-      transition={{ duration: 0.15 }}
-    >
-      <div className="network-shell flex min-h-0 flex-col overflow-hidden rounded-lg border">
-        <div className="network-toolbar flex min-h-10 min-w-0 shrink-0 flex-wrap items-center gap-2 border-b px-3 py-1.5">
-          <div className="relative min-w-[220px] flex-1">
-            <Search className="network-search-icon pointer-events-none absolute left-2.5 top-1/2 z-[1] h-3.5 w-3.5 -translate-y-1/2" />
-            <input
-              aria-label={t("Search request logs")}
-              className="network-filter-input h-7 w-full rounded-md border pl-8 pr-2 text-[12px] font-semibold outline-none"
-              onChange={(event) => updateFilter({ query: event.target.value })}
+    <ErrorBoundary fallbackTitle="请求日志视图渲染失败">
+      <motion.div
+        animate={{ opacity: 1 }}
+        className="network-view min-w-0"
+        initial={{ opacity: 0 }}
+        transition={{ duration: 0.15 }}
+      >
+        <div className="network-shell flex min-h-0 flex-col overflow-hidden rounded-lg border">
+          <div className="network-toolbar flex min-h-10 min-w-0 shrink-0 flex-wrap items-center gap-2 border-b px-3 py-1.5">
+            <div className="relative min-w-[220px] flex-1">
+              <Search className="network-search-icon pointer-events-none absolute left-2.5 top-1/2 z-[1] h-3.5 w-3.5 -translate-y-1/2" />
+              <input
+                aria-label={t("Search request logs")}
+                className="network-filter-input h-7 w-full rounded-md border pl-8 pr-2 text-[12px] font-semibold outline-none"
+                onChange={(event) => updateFilter({ query: event.target.value })}
               placeholder={t("筛选日志、模型、请求或响应")}
               value={filter.query ?? ""}
             />
@@ -677,7 +715,8 @@ export function LogsView({
           </div>
         </div>
       </div>
-    </motion.div>
+      </motion.div>
+    </ErrorBoundary>
   );
 }
 
@@ -1630,13 +1669,19 @@ function useLogBodyWorkerView(
     };
 
     worker.onerror = (event) => {
+      const message = event.message || "Body formatter worker failed.";
+      worker.terminate();
+      if (workerRef.current === worker) workerRef.current = undefined;
       setBodyView((current) => current.bodyKey === bodyKey && current.mode === mode
-        ? { ...current, error: event.message || "Body formatter worker failed.", loading: false }
+        ? { ...current, error: message, loading: false, visible: current.visible || createLogBodyPreviewText(body, logBodyPreviewTextLimit) }
         : current);
     };
 
+    const formatterBody = body && body.text.length > logBodyWorkerHardTextLimit
+      ? { ...body, preview: true, text: `Body too large to format inline (${body.text.length} chars). Use chunked view.` }
+      : body;
     worker.postMessage({
-      body,
+      body: formatterBody,
       bodyKey,
       id: formatRequestId,
       kind: "format",
@@ -1953,6 +1998,10 @@ function LogJsonPanel({
         }
         chunks.push(chunk.text);
         lastChunk = chunk;
+        const accumulatedLength = chunks.reduce((total, part) => total + part.length, 0);
+        if (!effectiveBody.bodyRef && accumulatedLength > logBodyWorkerHardTextLimit) {
+          throw new Error("Body is too large for inline formatting. Use the paged chunk viewer instead.");
+        }
         if (chunk.eof) {
           break;
         }
@@ -1972,7 +2021,14 @@ function LogJsonPanel({
       setBodyMode("full");
     } catch (error) {
       if (fullBodyLoadIdRef.current === loadId) {
-        setFullBodyError(error instanceof Error ? error.message : String(error));
+        const message = error instanceof Error ? error.message : String(error);
+        if (message.includes("Use the paged chunk viewer")) {
+          setFullBodyError("");
+          setFullBodyLoading(false);
+          void loadBodyChunk(0);
+        } else {
+          setFullBodyError(message);
+        }
       }
     } finally {
       if (fullBodyLoadIdRef.current === loadId) setFullBodyLoading(false);
@@ -2155,10 +2211,13 @@ function LogJsonBodyContent({
   value: unknown;
   visible: string;
 }) {
+  const boundedVisible = visible.length > logBodyDomTextLimit
+    ? `${visible.slice(0, logBodyDomTextLimit)}\n\n... ${formatCompactNumber(visible.length - logBodyDomTextLimit)} characters omitted from display ...`
+    : visible;
   return showJsonTree ? (
     <LogJsonTree expandedPaths={expandedJsonPaths} onToggle={onToggleJsonPath} value={value} />
   ) : (
-    <pre className="network-code min-h-0 flex-1 overflow-auto whitespace-pre-wrap break-words p-3 pr-20 font-mono text-[11px] leading-5">{visible}</pre>
+    <pre className="network-code min-h-0 flex-1 overflow-auto whitespace-pre-wrap break-words p-3 pr-20 font-mono text-[11px] leading-5">{boundedVisible}</pre>
   );
 }
 
@@ -2181,11 +2240,14 @@ function LogBodyChunkContent({
   const rangeLabel = chunk
     ? `${formatBytes(chunk.offset)}-${formatBytes(chunk.offset + chunk.length)} / ${formatBytes(chunk.sizeBytes)}`
     : "";
-  const content = chunkView.loading && !chunk
+  const rawContent = chunkView.loading && !chunk
     ? t("Loading full payload...")
     : chunkView.error && !chunk
       ? chunkView.error
       : visible || (query.trim() ? "No matching lines" : "");
+  const content = rawContent.length > logBodyDomTextLimit
+    ? `${rawContent.slice(0, logBodyDomTextLimit)}\n\n... ${formatCompactNumber(rawContent.length - logBodyDomTextLimit)} characters omitted from display ...`
+    : rawContent;
 
   return (
     <div className="flex min-h-0 flex-1 flex-col">
@@ -2449,7 +2511,10 @@ function LogBodyViewer({
   }, [copied]);
 
   async function copyBody() {
-    await copyTextToClipboard(copyText);
+    const visibleText = copyText.length > logBodyWorkerHardTextLimit
+      ? `${copyText.slice(0, logBodyWorkerHardTextLimit)}\n\n... copy limited to the first ${formatBytes(logBodyWorkerHardTextLimit)} ...`
+      : copyText;
+    await copyTextToClipboard(visibleText);
     setCopied(true);
   }
 
@@ -2523,6 +2588,15 @@ function JsonTreeNode({
   value: unknown;
 }) {
   const t = useAppText();
+
+  if (depth >= logJsonMaxDepth && isJsonContainer(value)) {
+    return (
+      <div className="network-muted min-w-0 whitespace-pre-wrap break-words" style={{ paddingLeft: depth * 16 }}>
+        {label !== undefined ? <JsonTreeLabel kind={labelKind} label={label} /> : null}
+        … depth limit …
+      </div>
+    );
+  }
 
   if (!isJsonContainer(value)) {
     return (
@@ -2807,10 +2881,18 @@ function NetworkKeyValueTable({ emptyLabel = "No values", rows }: { emptyLabel?:
 
 function NetworkBodyViewer({ body }: { body?: ProxyNetworkBody }) {
   const t = useAppText();
+  const [offset, setOffset] = useState(0);
+
+  useEffect(() => setOffset(0), [body?.sizeBytes, body?.text]);
 
   if (!body || (!body.text && body.sizeBytes === 0)) {
     return <div className="px-4 py-10 text-center text-[12px] font-semibold text-[#777d86]">{t("No body")}</div>;
   }
+
+  const boundedOffset = Math.min(offset, Math.max(0, body.text.length - logBodyDomTextLimit));
+  const visibleText = body.text.slice(boundedOffset, boundedOffset + logBodyDomTextLimit);
+  const hasPrevious = boundedOffset > 0;
+  const hasNext = boundedOffset + visibleText.length < body.text.length;
 
   return (
     <div className="min-w-0">
@@ -2820,15 +2902,23 @@ function NetworkBodyViewer({ body }: { body?: ProxyNetworkBody }) {
         {body.encoding === "base64" ? <span>base64</span> : null}
         {body.decodedFrom ? <span>{body.decodedFrom} {t("decoded")}</span> : null}
         {body.truncated ? <span>{t("truncated")}</span> : null}
+        {body.text.length > logBodyDomTextLimit ? (
+          <div className="ml-auto flex items-center gap-2">
+            <button className="network-control-button rounded border px-2 py-1 disabled:opacity-40" disabled={!hasPrevious} onClick={() => setOffset((value) => Math.max(0, value - logBodyDomTextLimit))} type="button">{t("Previous")}</button>
+            <span>{formatBytes(boundedOffset)}-{formatBytes(boundedOffset + visibleText.length)} / {formatBytes(body.text.length)}</span>
+            <button className="network-control-button rounded border px-2 py-1 disabled:opacity-40" disabled={!hasNext} onClick={() => setOffset((value) => Math.min(body.text.length - logBodyDomTextLimit, value + logBodyDomTextLimit))} type="button">{t("Next")}</button>
+          </div>
+        ) : null}
       </div>
       {body.error ? <div className="network-body-warning border-b px-3 py-2 text-[12px]">{body.error}</div> : null}
-      <NetworkInspectorCode value={body.text || t("No body")} />
+      <NetworkInspectorCode value={visibleText} />
     </div>
   );
 }
 
 function NetworkInspectorCode({ value }: { value: string }) {
+  const text = value.length > logBodyDomTextLimit ? value.slice(0, logBodyDomTextLimit) : value;
   return (
-    <pre className="network-code min-h-[240px] overflow-auto whitespace-pre-wrap break-words p-3 font-mono text-[11px] leading-5">{value}</pre>
+    <pre className="network-code min-h-[240px] max-h-[70vh] overflow-auto whitespace-pre-wrap break-words p-3 font-mono text-[11px] leading-5">{text}</pre>
   );
 }

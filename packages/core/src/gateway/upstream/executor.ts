@@ -10,6 +10,7 @@ import { modelRegistryForConfig, normalizeRouteSelector, parseProviderModelSelec
 import { requestProtocolForPath } from "@ccr/core/routing/protocol-endpoints";
 import { resolveConfiguredProviderModelSelector, resolveUniqueConfiguredProviderModelSelector } from "@ccr/core/routing/model-resolution";
 import { estimateLimitUsage } from "@ccr/core/gateway/limits/window-limiter";
+import { acquireProviderWindow, normalizeProviderKey } from "@ccr/core/gateway/limits/provider-window-limiter";
 import { providerCredentialLimitState, readProviderCredentialCooldown, recordProviderCredentialOutcome } from "@ccr/core/providers/credential-pool";
 import { isRecord, stringValue } from "@ccr/core/gateway/internal/value";
 import { isLocalClaudeCodeOauthProviderPlugin, mergeAnthropicBetaValues } from "@ccr/core/providers/oauth-plugin";
@@ -450,6 +451,40 @@ export async function fetchUpstreamWithFallback(input: {
     const attemptProvider = attempt.logicalProvider ?? (
       attempt.target?.kind === "provider" ? attempt.target.provider.name : undefined
     );
+    // Provider-level soft throttle: minute RPM/TPM per provider, all agents share the window.
+    // When full, wait for the next natural minute boundary instead of failing with 429.
+    const attemptTargetProviderName = (() => {
+      const t = attempt.target as { kind?: string; provider?: { name?: string } } | undefined;
+      return t?.kind === "provider" ? t.provider?.name : undefined;
+    })();
+    const rawThrottleKey = normalizeProviderKey(String(attemptProvider ?? attemptTargetProviderName ?? ""));
+    const targetProvider = rawThrottleKey
+      ? input.config.Providers.find((p) => normalizeProviderKey(p.name) === rawThrottleKey)
+      : undefined;
+    const configuredLimits = targetProvider?.softRateLimits;
+    const throttleProviderKey = rawThrottleKey && configuredLimits && (configuredLimits.rpm != null || configuredLimits.tpm != null)
+      ? rawThrottleKey
+      : undefined;
+    if (throttleProviderKey && configuredLimits) {
+      const inputBody = input.body as Buffer | undefined;
+      const throttleUsage = estimateLimitUsage(input.method, inputBody ?? Buffer.alloc(0));
+      const throttleTokens = throttleUsage.totalTokens || Math.ceil(((inputBody)?.byteLength ?? 0) / 4) || 1;
+      const throttleWaitedFrom = Date.now();
+      const providerLimits = { [throttleProviderKey]: configuredLimits } as const;
+      await acquireProviderWindow(throttleProviderKey, throttleTokens, providerLimits, { signal: input.signal });
+      const throttleWaitedMs = Date.now() - throttleWaitedFrom;
+      if (throttleWaitedMs > 50) {
+        input.trace?.capture({
+          changes: [{ after: String(throttleWaitedMs), operation: "add", path: "/provider-window/waitedMs", scope: "headers" }],
+          durationMs: throttleWaitedMs,
+          kind: "outcome",
+          name: `provider-window.throttle:${throttleProviderKey}`,
+          phase: "outcome",
+          startedAtMs: throttleWaitedFrom,
+          target: { provider: throttleProviderKey }
+        });
+      }
+    }
     const attemptStartedAt = Date.now();
     const attemptStartedAtMonoMs = monotonicNowMs();
     input.trace?.capture({
