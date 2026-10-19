@@ -20,7 +20,7 @@
 
 ## 3. 硬约束（不可违背）
 
-- **数据目录**：Win ` %APPDATA%\claude-code-router`（Dev 版 `claude-code-router-dev`），由 `packages/core/src/runtime/app-paths.ts:APP_STORAGE_NAME` 决定，改名即换身份。
+- **数据目录**：Win `%APPDATA%\claude-code-router`（Dev 版 `claude-code-router-dev`），由 `packages/core/src/runtime/app-paths.ts:APP_STORAGE_NAME` 决定，改名即换身份。
 - **单实例**：`packages/electron/src/main/main-app.ts:requestSingleInstanceLock()` + `electron-builder.json:appId`，同 `appId` 的第二个实例会 `second-instance` 唤起第一个后退出。
 - **端口**：默认 `3456`（网关）、`3458`（管理端 Apifox），见 `packages/core/src/config/default-config.ts`。
 - **协议**：`ccr://`（`packages/core/src/contracts/deep-link.ts:appDeepLinkProtocol`），后安装的覆盖注册。
