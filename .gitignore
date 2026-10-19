@@ -25,3 +25,6 @@ docker/local-ai-gateway/*.tgz
 work/
 *.bak
 *.bak-*
+
+# Dev 免安装产物（输出到 D:/SoftWare/gateway/claude-code-router-dev，不入仓）
+# 源码外输出，无需忽略源码内，但保留占位说明

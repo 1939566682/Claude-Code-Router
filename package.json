@@ -74,7 +74,10 @@
     "typecheck": "tsc --noEmit",
     "rebuild:sqlite3": "electron-rebuild -f -w better-sqlite3",
     "models:build": "node scripts/generate-models-json.mjs",
-    "version": "npm run models:build"
+    "version": "npm run models:build",
+    "build:dev": "powershell -ExecutionPolicy Bypass -File scripts/build-dev.ps1",
+    "build:dev:install": "powershell -ExecutionPolicy Bypass -File scripts/build-dev.ps1 -Install",
+    "build:dev:dir": "powershell -ExecutionPolicy Bypass -File scripts/build-dev.ps1"
   },
   "dependencies": {
     "@the-next-ai/ai-gateway": "^1.0.21",
