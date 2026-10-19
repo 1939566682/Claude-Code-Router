@@ -19,6 +19,7 @@
 | 8 | `docs/cognition/decisions/ADR-003.md` | `cli-middleware` 多字节/丢帧修复取舍 | 稳定 |
 | 9 | `docs/cognition/_templates/ADR.md` | ADR 模板 | 稳定 |
 | 10 | `docs/cognition/_templates/INVARIANT.md` | 约束条目模板 | 稳定 |
+| 11 | `docs/cognition/decisions/ADR-004.md` | Dev 协议/更新共用串行选型 | 稳定 |
 
 ## 2. 版本化
 
