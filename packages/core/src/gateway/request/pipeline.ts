@@ -30,6 +30,7 @@ import { adaptRouteRequestBody, restoreRouteRequestBody } from "@ccr/core/routin
 import { reserveApiKeyLimits } from "@ccr/core/gateway/auth/api-key-authorizer";
 import { recordProviderCredentialOutcome } from "@ccr/core/providers/credential-pool";
 import { codexApplyPatchBridgeResponseStream, prepareCodexApplyPatchBridgeRequest } from "@ccr/core/gateway/features/codex-patch-bridge";
+import { openAiChatToResponsesBridgeStream } from "@ccr/core/gateway/features/openai-chat-to-responses-bridge";
 import { codexMultiAgentBridgeResponseStream, prepareCodexMultiAgentBridgeRequest } from "@ccr/core/gateway/features/codex-multi-agent-bridge";
 import { rewriteAnthropicMessageStartModelStream, shouldRewriteAnthropicMessageStartModel } from "@ccr/core/gateway/features/anthropic-response-model";
 import { prepareCursorOpenAICompatChatBody } from "@ccr/core/gateway/features/cursor-compat";
@@ -1000,9 +1001,17 @@ export class GatewayRequestPipeline {
         protocol: responseProtocol
       });
       const upstreamBody = upstreamBodySource.pipe(upstreamExperienceMeter.stream);
-      const patchedResponseBody = codexApplyPatchBridgeActive
-        ? codexApplyPatchBridgeResponseStream(upstreamBody, responseHeaders)
+      const isCodexResponsesRequest = requestProtocol === "openai_responses";
+      // 无条件桥接：Codex 的 /v1/responses 若上游以 Chat SSE 回来，直接重封装为 Responses SSE；
+      // 不依赖 credentialProtocol 是否标记为 openai_chat_completions（避免 undefined 导致 SKIP）。
+      // 已是 Responses 形态的事件（含 core gateway 正常转换的产物）按块原样透传。
+      const shouldBridge = isCodexResponsesRequest;
+      const chatResponsesBody = shouldBridge
+        ? openAiChatToResponsesBridgeStream(upstreamBody, responseHeaders)
         : upstreamBody;
+      const patchedResponseBody = codexApplyPatchBridgeActive
+        ? codexApplyPatchBridgeResponseStream(chatResponsesBody, responseHeaders)
+        : chatResponsesBody;
       const multiAgentResponseBody = codexMultiAgentBridgeActive
         ? codexMultiAgentBridgeResponseStream(patchedResponseBody, responseHeaders)
         : patchedResponseBody;
