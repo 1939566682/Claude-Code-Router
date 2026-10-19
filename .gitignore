@@ -21,3 +21,7 @@ blob-report
 .tmp
 .test-dist
 docker/local-ai-gateway/*.tgz
+# 本地调试与临时备份（不入仓）
+work/
+*.bak
+*.bak-*
