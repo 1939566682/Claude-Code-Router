@@ -2168,8 +2168,7 @@ async function runOpenCodeBotCli(command, args, cwd, options = {}) {
     const tail = pendingDecoder.end();
     if (tail) {
       pendingJson += tail;
-      const tailLines = pendingJson.split(/?
-/g);
+      const tailLines = pendingJson.split(/\r?\n/g);
       pendingJson = tailLines.pop() || "";
       if (typeof options.onJson === "function") {
         for (const line of tailLines) { try { options.onJson(JSON.parse(line)); } catch { /* Ignore diagnostics. */ } }
