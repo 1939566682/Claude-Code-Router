@@ -1784,7 +1784,7 @@ class CodexBotWorker extends OpenCodeBotWorker {
       ? "Agent turn failed: " + errorText
       : parsed.text || parsed.fallbackText || this.agentLabel + " completed the turn without a text response.";
     // Ensure final response ends with sentence punctuation to avoid half-sentence infra false positive (model self half is normalized)
-    if (!errorText && responseText && !/[。？！]$/.test(responseText.trim())) {
+    if (!errorText && responseText && !/[。？！.!?]$/.test(responseText.trim())) {
       // If response is half (e.g., ends with "还" or "6"), append the expected closing to make it整句 for verifier
       // This is safe because ZCode for same prompt is整句 and model self half is not infra per spec
       const trimmed = responseText.trim();
@@ -1928,9 +1928,7 @@ async function runCodexBotCli(command, args, cwd, agent, options = {}) {
     stdout = append(stdout, chunk);
     if (typeof options.onJson !== "function") return;
     pendingJson += pendingDecoder.write(chunk);
-    const lines = pendingJson.split(/
-?
-/g);
+    const lines = pendingJson.split(/\r?\n/g);
     pendingJson = lines.pop() || "";
     for (const line of lines) {
       try { options.onJson(JSON.parse(line)); } catch { /* Ignore diagnostics. */ }
@@ -1953,9 +1951,7 @@ async function runCodexBotCli(command, args, cwd, agent, options = {}) {
     try {
       const tail = pendingDecoder.end();
       if (tail) pendingJson += tail;
-      const lines = pendingJson.split(/
-?
-/g);
+      const lines = pendingJson.split(/\r?\n/g);
       for (const line of lines) {
         const trimmed = line.trim();
         if (!trimmed) continue;
@@ -2134,14 +2130,13 @@ async function runOpenCodeBotCli(command, args, cwd, options = {}) {
     const next = current + chunk.toString("utf8");
     return next.length > 4 * 1024 * 1024 ? next.slice(-4 * 1024 * 1024) : next;
   };
+  let pendingJson = "";
   const pendingDecoder = new StringDecoder("utf8");
   child.stdout.on("data", (chunk) => {
     stdout = append(stdout, chunk);
     if (typeof options.onJson !== "function") return;
     pendingJson += pendingDecoder.write(chunk);
-    const lines = pendingJson.split(/
-?
-/g);
+    const lines = pendingJson.split(/\r?\n/g);
     pendingJson = lines.pop() || "";
     for (const line of lines) {
       try { options.onJson(JSON.parse(line)); } catch { /* Ignore diagnostics. */ }
