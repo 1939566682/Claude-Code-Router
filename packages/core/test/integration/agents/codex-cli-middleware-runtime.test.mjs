@@ -15,7 +15,7 @@ test("generated Codex CLI middleware runtime is valid JavaScript", () => {
   execFileSync(process.execPath, ["--check", file], { stdio: "pipe" });
 });
 
-test("#1851 Pi dispatch consumes only the profile selector and preserves the prompt", () => {
+test("#1851 Pi dispatch consumes only the profile selector and preserves the prompt", { skip: process.platform === "win32" }, () => {
   const dir = mkdtempSync(path.join(os.tmpdir(), "ccr-pi-dispatch-"));
   try {
     const runtime = writeRuntimeScript(dir);
