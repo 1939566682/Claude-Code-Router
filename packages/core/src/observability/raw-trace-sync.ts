@@ -1652,7 +1652,7 @@ export async function readRawTraceRequestLogBundle(
   const upstreamRequestHeaders = headerRecordFromUnknown(upstreamRequestMetadata?.headers);
   const clientReqId = stringValue(readUnknownHeader(upstreamRequestHeaders, "x-client-request-id"));
   const turnKey = stringValue(manifest.turnKey);
-  const requestId = clientReqId && clientReqId !== turnKey ? clientReqId : bundleId;
+  const requestId = clientReqId && clientReqId !== turnKey ? clientReqId : turnKey || bundleId;
   const client = inferGatewayClient(undefined, clientRequestHeaders ?? {});
   const attempt = positiveAttemptNumber(readUnknownHeader(
     clientRequestHeaders,
