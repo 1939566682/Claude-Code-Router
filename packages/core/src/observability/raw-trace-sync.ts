@@ -1486,7 +1486,7 @@ export function applyRawTraceRequestLogPolicy(
   input: RequestLogRawTraceUpdateInput
 ): RawTraceRequestLogPolicy {
   const outcome = rawTraceRequestOutcome(input.statusCode);
-  const configuredBodyCapture = config.observability.requestLogBodyCapture ?? "all";
+  const configuredBodyCapture = effectiveRequestLogBodyCapture(config);
   const bodyCapturePolicy = resolveRawTraceBodyLimit(config.observability.requestLogMaxBodyBytes) > 0
     ? configuredBodyCapture
     : "none";
@@ -1514,6 +1514,15 @@ export function applyRawTraceRequestLogPolicy(
       ? suppressRequestLogRawTraceBodies(policyInput)
       : policyInput
   };
+}
+
+export function effectiveRequestLogBodyCapture(config: AppConfig): "all" | "errors" | "none" {
+  const raw = config.observability.requestLogBodyCapture ?? "all";
+  if (config.observability.requestLogMode === "light" && raw === "all") {
+    // light default: read usage directly, only errors keep bodies
+    return "errors";
+  }
+  return raw;
 }
 
 export function rawTraceRequestOutcome(

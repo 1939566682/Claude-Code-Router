@@ -1009,6 +1009,12 @@ function parseObservability(value: unknown): Partial<ObservabilityConfig> | unde
   if (typeof value.requestLogs === "boolean") {
     observability.requestLogs = value.requestLogs;
   }
+  if (value.requestLogMode === "light" || value.requestLogMode === "full") {
+    observability.requestLogMode = value.requestLogMode;
+  }
+  if ((value as Record<string, unknown>).request_log_mode === "light" || (value as Record<string, unknown>).request_log_mode === "full") {
+    observability.requestLogMode = (value as Record<string, unknown>).request_log_mode as ObservabilityConfig["requestLogMode"];
+  }
   if (typeof value.agentAnalysis === "boolean") {
     observability.agentAnalysis = value.agentAnalysis;
   }

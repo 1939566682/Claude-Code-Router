@@ -39,7 +39,7 @@ import { appendAggregateErrorAttemptSummary, shouldBufferAggregateErrorBody } fr
 import { parseJsonObjectSafe, serializeJsonBody, takeJsonObject } from "@ccr/core/gateway/http/body";
 import { createGatewayModelsResponse, prepareClaudeAppDiscoveredModelRequest, prepareClaudeCodeDiscoveredModelRequest, shouldServeGatewayModelsResponse } from "@ccr/core/gateway/features/model-discovery";
 import { providerProtocolForClientProtocol, resolveProviderLogName, resolveResponseProviderProtocol, sanitizeHeaderValue } from "@ccr/core/providers/runtime-topology";
-import { createBodySampler, requestLogSampled, shouldRecordRequestLogs } from "@ccr/core/observability/raw-trace-sync";
+import { createBodySampler, effectiveRequestLogBodyCapture, requestLogSampled, shouldRecordRequestLogs } from "@ccr/core/observability/raw-trace-sync";
 import { RequestRouteTraceRecorder } from "@ccr/core/observability/route-trace";
 import { coreGatewayUsageAttributionConfig } from "@ccr/core/gateway/core-runtime/config-compiler";
 import { providerModelPricingForUsage } from "@ccr/core/models/pricing-service";
@@ -305,7 +305,7 @@ export class GatewayRequestPipeline {
           markGatewayRequestLogDropped(requestId, "sampled");
           return;
         }
-        const bodyCapture = config.observability.requestLogBodyCapture ?? "all";
+        const bodyCapture = effectiveRequestLogBodyCapture(config);
         const captureBody = bodyCapture === "all" || (bodyCapture === "errors" && !successful);
         // errors 模式下成功请求的正文不持久化，但 usage 仍需从 responseBodyText 解析；
         // record() 内部会在 bodyCapturePolicy=errors + successful 时剥离正文，只保留 usage。

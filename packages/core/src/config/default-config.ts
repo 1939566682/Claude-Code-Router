@@ -119,6 +119,7 @@ export function createDefaultAppConfig(options: DefaultAppConfigOptions = {}): A
     launchAtLogin: false,
     observability: {
       agentAnalysis: false,
+      requestLogMode: "light",
       requestLogBodyCapture: "errors",
       requestLogMaxBodyBytes: defaultRequestLogBodyBytes,
       requestLogSuccessSampleRate: 1,

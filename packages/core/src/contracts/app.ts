@@ -1286,6 +1286,8 @@ export type ProxyRuntimeConfig = {
 
 export type ObservabilityConfig = {
   agentAnalysis: boolean;
+  /** light (default): usage-only for success, bodies only on error; full: capture bodies for all */
+  requestLogMode?: "light" | "full";
   requestLogBodyCapture?: "all" | "errors" | "none";
   requestLogMaxBodyBytes?: number;
   requestLogSuccessSampleRate?: number;
