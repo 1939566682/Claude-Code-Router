@@ -202,6 +202,21 @@ export async function applyProfileConfig(
 
   const profileApiKeys = await ensureProfileApiKeys(config, profiles);
 
+  if (configOnlyHasPlaceholderProviders(config)) {
+    const message = "profile apply skipped: configuration only contains placeholder/test providers";
+    console.warn(`[profile-apply] ${message} (providers=${(config.Providers ?? []).map((item) => String(item.name ?? "")).join(", ")}). Set CCR_ALLOW_PLACEHOLDER_PROFILES=1 to override.`);
+    result.clients = profiles.map((profile) => ({
+      appliedAt,
+      client: profile.agent,
+      enabled: profile.enabled,
+      message,
+      ok: true,
+      path: profilePath(profile)
+    }));
+    result.clients.push(...takeoverStatuses);
+    return result;
+  }
+
   for (const profile of profiles) {
     const token = profileApiKeys.get(profile.id) ?? fallbackClientToken;
     result.clients.push(
@@ -588,10 +603,30 @@ function applyCodexProfile(config: AppConfig, profile: ProfileConfig, token: str
     const configFormat = normalizeCodexConfigFormat(profile.configFormat);
     const modelCatalogFile = codexModelCatalogFile(configFile);
     const profileWithResolvedModel = { ...profile, model };
-    const modelCatalogResult = writeFileWithBackup(
-      modelCatalogFile,
-      codexModelCatalogJson(config, model, { allowedModels: profileAllowedModels(profileWithResolvedModel) })
-    );
+    const placeholderTarget = placeholderProfileTarget(config, model);
+    if (placeholderTarget) {
+      console.warn(
+        `[profile-apply] skipped placeholder target "${placeholderTarget}" for ${clientName}; ${configFile} left untouched. `
+        + "Set CCR_ALLOW_PLACEHOLDER_PROFILES=1 to apply test fixtures on purpose."
+      );
+      return {
+        appliedAt,
+        client: profile.agent,
+        enabled: true,
+        message: `${clientName} profile skipped: "${placeholderTarget}" looks like a test/placeholder target.`,
+        ok: true,
+        path: configFile
+      };
+    }
+    const modelCatalogJson = codexModelCatalogJson(config, model, { allowedModels: profileAllowedModels(profileWithResolvedModel) });
+    const catalogEntryCount = countCodexCatalogEntries(modelCatalogJson);
+    if (catalogEntryCount <= 1) {
+      console.warn(
+        `[profile-apply] ${clientName} model "${model}" produced only ${catalogEntryCount} catalog entr`
+        + `${catalogEntryCount === 1 ? "y" : "ies"} (providers=${(config.Providers ?? []).length}); writing ${modelCatalogFile}.`
+      );
+    }
+    const modelCatalogResult = writeFileWithBackup(modelCatalogFile, modelCatalogJson);
     const appModelCatalogResult = writeCodexCompatibleAppModelCatalog(CONFIGDIR, profileWithResolvedModel, config);
     const showAllSessions = profile.agent === "zcode" || profile.agent === "workbuddy" ? false : Boolean(profile.showAllSessions);
     const toolHubMcpResult = writeCodexToolHubMcpRuntimeConfig(config, token);
@@ -1087,6 +1122,62 @@ function resolveCodexConfigFile(profile: ProfileConfig): string {
 
 function codexModelCatalogFile(configFile: string): string {
   return path.join(path.dirname(configFile), "ccr-model-catalog.json");
+}
+
+/**
+ * 占位/测试夹具防护。
+ *
+ * 仓库测试与探针脚本会使用 "Test Provider" + "test-model"（base_url 指向
+ * 127.0.0.1:9）这类假配置；一旦被应用到真实 profile，会把
+ * `~/.codex/ccr-model-catalog.json` 覆盖成只有一条假模型的目录，
+ * Codex 的模型选择器随之只剩这一条（2026-10-19 事故）。
+ *
+ * 命中时跳过整次 apply（config.toml / catalog 都不写），保留现场。
+ * 确实需要用占位配置调试时，置 `CCR_ALLOW_PLACEHOLDER_PROFILES=1`。
+ */
+function placeholderProfileTarget(config: AppConfig, model: string): string | undefined {
+  if (process.env.CCR_ALLOW_PLACEHOLDER_PROFILES === "1") {
+    return undefined;
+  }
+  const normalizedModel = model.trim().toLowerCase();
+  const separator = normalizedModel.lastIndexOf("/");
+  const providerName = separator >= 0 ? normalizedModel.slice(0, separator) : "";
+  const bareModel = separator >= 0 ? normalizedModel.slice(separator + 1) : normalizedModel;
+  if (bareModel === "test-model" || providerName === "test provider") {
+    return model;
+  }
+  const provider = (config.Providers ?? []).find(
+    (candidate) => String(candidate.name ?? "").trim().toLowerCase() === providerName
+  );
+  return provider && isPlaceholderProvider(provider) ? model : undefined;
+}
+
+function countCodexCatalogEntries(json: string): number {
+  try {
+    const parsed = JSON.parse(json) as { models?: unknown };
+    return Array.isArray(parsed.models) ? parsed.models.length : 0;
+  } catch {
+    return 0;
+  }
+}
+
+function isPlaceholderProvider(provider: AppConfig["Providers"][number]): boolean {
+  const name = String(provider.name ?? "").trim().toLowerCase();
+  const id = String(provider.id ?? "").trim().toLowerCase();
+  const baseUrl = String(provider.api_base_url ?? "").trim();
+  const models = Array.isArray(provider.models) ? provider.models : [];
+  return name === "test provider"
+    || id === "test-provider"
+    || /^https?:\/\/127\.0\.0\.1:9(?:\/|$)/i.test(baseUrl)
+    || models.some((model) => String(model ?? "").trim().toLowerCase() === "test-model");
+}
+
+function configOnlyHasPlaceholderProviders(config: AppConfig): boolean {
+  if (process.env.CCR_ALLOW_PLACEHOLDER_PROFILES === "1") {
+    return false;
+  }
+  const providers = config.Providers ?? [];
+  return providers.length > 0 && providers.every(isPlaceholderProvider);
 }
 
 function zcodeMiddlewareModelCatalogFile(configFile: string): string {
