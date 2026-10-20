@@ -572,6 +572,15 @@ function ObservabilitySettingsPage({
           label={copy.settings.requestLogs}
           onChange={(requestLogs) => onChange({ requestLogs })}
         />
+        {observability.requestLogs ? (
+          <SettingsSwitchRow
+            checked={(observability.requestLogMode ?? "light") === "full"}
+            description={copy.settings.requestLogModeDescription}
+            icon={Database}
+            label={copy.settings.requestLogMode}
+            onChange={(checked) => onChange({ requestLogMode: checked ? "full" : "light" })}
+          />
+        ) : null}
         <SettingsSwitchRow
           checked={observability.agentAnalysis}
           description={copy.settings.agentAnalysisDescription}

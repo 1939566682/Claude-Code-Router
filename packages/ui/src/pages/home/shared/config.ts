@@ -106,7 +106,8 @@ export function normalizeObservabilityConfig(config: Partial<AppConfig["observab
     requestLogBodyCapture: config?.requestLogBodyCapture ?? fallbackConfig.observability.requestLogBodyCapture,
     requestLogMaxBodyBytes: config?.requestLogMaxBodyBytes ?? fallbackConfig.observability.requestLogMaxBodyBytes,
     requestLogSuccessSampleRate: config?.requestLogSuccessSampleRate ?? fallbackConfig.observability.requestLogSuccessSampleRate,
-    requestLogs: Boolean(config?.requestLogs)
+    requestLogs: Boolean(config?.requestLogs),
+    requestLogMode: (config as Record<string, unknown>).request_log_mode === "full" || config?.requestLogMode === "full" ? "full" : "light"
   };
 }
 

@@ -23,6 +23,10 @@ export type AppCopy = {
     launchAtLogin: string;
     launchAtLoginDescription: string;
     observability: string;
+    requestLogMode: string;
+    requestLogModeDescription: string;
+    requestLogModeLight: string;
+    requestLogModeFull: string;
     proxy: string;
     requestLogs: string;
     requestLogsDescription: string;
@@ -114,6 +118,10 @@ export const appCopy: Record<ResolvedLanguage, AppCopy> = {
       logs: "Logs",
       networking: "Networking",
       observability: "Observability",
+      requestLogMode: "Full request details",
+      requestLogModeDescription: "When off, only error bodies are kept. Turn on to also save successful request/response bodies.",
+      requestLogModeFull: "Full (all bodies)",
+      requestLogModeLight: "Light (errors only)",
       overview: "Overview",
       profile: "Agent Profiles",
       providers: "Providers",
@@ -770,6 +778,10 @@ export const appCopy: Record<ResolvedLanguage, AppCopy> = {
       launchAtLogin: "开机自启",
       launchAtLoginDescription: "登录系统后自动打开 Claude Code Router。",
       observability: "日志与观测",
+      requestLogMode: "完整请求详情",
+      requestLogModeDescription: "关闭时仅保留错误正文以便排障；开启后将同时保存成功请求的请求/响应正文。",
+      requestLogModeFull: "完整（全部正文）",
+      requestLogModeLight: "轻量（仅错误）",
       proxy: "代理",
       requestLogs: "请求日志",
       requestLogsDescription: "记录网关请求并显示日志页。",
