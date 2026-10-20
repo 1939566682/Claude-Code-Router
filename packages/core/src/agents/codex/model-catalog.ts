@@ -550,7 +550,9 @@ function documentedReasoningProfile(model: string): DocumentedReasoningProfile |
     return profile(["low", "medium", "high"], "high");
   }
 
-  return undefined;
+  // Fallback: unknown models (e.g. CodeCraft custom like qwen3.8-max, glm-5.3 outside catalog)
+  // should still expose the standard 6-level reasoning menu instead of empty.
+  return profile(["low", "medium", "high", "xhigh", "max", "ultra"], "medium");
 }
 
 function findConfiguredProvider(
