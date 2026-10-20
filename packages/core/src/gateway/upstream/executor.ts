@@ -10,7 +10,7 @@ import { modelRegistryForConfig, normalizeRouteSelector, parseProviderModelSelec
 import { requestProtocolForPath } from "@ccr/core/routing/protocol-endpoints";
 import { resolveConfiguredProviderModelSelector, resolveUniqueConfiguredProviderModelSelector } from "@ccr/core/routing/model-resolution";
 import { estimateLimitUsage } from "@ccr/core/gateway/limits/window-limiter";
-import { acquireProviderWindow, normalizeProviderKey } from "@ccr/core/gateway/limits/provider-window-limiter";
+import { acquireProviderWindow, normalizeProviderKey, recordRateLimitFeedback } from "@ccr/core/gateway/limits/provider-window-limiter";
 import { providerCredentialLimitState, readProviderCredentialCooldown, recordProviderCredentialOutcome } from "@ccr/core/providers/credential-pool";
 import { isRecord, stringValue } from "@ccr/core/gateway/internal/value";
 import { isLocalClaudeCodeOauthProviderPlugin, mergeAnthropicBetaValues } from "@ccr/core/providers/oauth-plugin";
@@ -559,6 +559,10 @@ export async function fetchUpstreamWithFallback(input: {
           statusCode: response.status
         });
         recordProviderCredentialOutcome(input.config, input.method, attempt, response.status, response.headers);
+        if (response.status === 429) {
+          const fbProvider = attemptProvider ?? attemptTargetProviderName;
+          if (fbProvider) recordRateLimitFeedback(fbProvider, response.headers);
+        }
         // Failed response bodies may never finish. Start cancellation without
         // waiting for upstream cleanup before trying the next provider.
         void cancelResponseBody(response);
@@ -582,6 +586,11 @@ export async function fetchUpstreamWithFallback(input: {
           ...(attemptProvider ? { provider: attemptProvider } : {})
         }
       });
+
+      if (response.status === 429) {
+        const fbProvider2 = attemptProvider ?? attemptTargetProviderName;
+        if (fbProvider2) recordRateLimitFeedback(fbProvider2, response.headers);
+      }
 
       return {
         attempt,

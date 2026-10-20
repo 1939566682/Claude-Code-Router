@@ -1,7 +1,9 @@
 /**
  * Provider-level soft rate limiter: RPM + TPM per provider per natural minute window.
- * When the window is full, requests queue until next minute's boundary (60 - now%60).
- * Used to hold requests instead of returning 429 — all agents sharing the provider are accounted together.
+ * Verified upstream: CodeCraft fixed-window per minute, :00 UTC aligned (Resets every minute).
+ * Natural-minute is correct; add header-aware precise wait (X-RateLimit-Reset / Retry-After)
+ * and burst smoothing so 429s converge without busy-loop.
+ * When the window is full, requests queue until precise reset, not estimated msToNextMinute only.
  */
 
 export type ProviderRateLimitConfig = {
@@ -19,6 +21,8 @@ type ProviderWindow = {
 };
 
 const windows = new Map<string, ProviderWindow>();
+// Precise reset from upstream headers (429 feedback). Unix-ms, per provider.
+const rateLimitResetAtMs = new Map<string, number>();
 let sweepTimer: ReturnType<typeof setInterval> | undefined;
 
 function nowMinute(): number {
@@ -46,6 +50,8 @@ function sweep(): void {
       windows.delete(key);
     }
   }
+  const now = Date.now();
+  for (const [k, at] of rateLimitResetAtMs) { if (at <= now) rateLimitResetAtMs.delete(k); }
 }
 
 function ensureSweep(): void {
@@ -58,6 +64,46 @@ function ensureSweep(): void {
 /**
  * Provider-name normalization: lower-case, trim.  "CodeCraft" -> "codecraft"
  */
+function parseRetryAfterMs(value: string | null | undefined): number | undefined {
+  const v = value?.trim(); if (!v) return undefined;
+  const sec = Number(v); if (Number.isFinite(sec) && sec >= 0) return Math.round(sec * 1000);
+  const d = Date.parse(v); if (Number.isFinite(d)) return Math.max(0, d - Date.now());
+  return undefined;
+}
+function pickHeader(headers: Headers | Record<string, string>, name: string): string | undefined {
+  if (headers instanceof Headers) return headers.get(name) ?? undefined;
+  const lower = name.toLowerCase();
+  for (const [k, v] of Object.entries(headers)) { if (k.toLowerCase() === lower) return v; }
+  return undefined;
+}
+function msToReset(providerKey: string): number {
+  const precise = rateLimitResetAtMs.get(providerKey);
+  if (precise != null) {
+    const ms = Math.max(0, precise - Date.now()) + 10;
+    if (ms > 0 && ms <= 60000) return ms;
+  }
+  return msToNextMinute();
+}
+export function recordRateLimitFeedback(providerKey: string, headers: Headers | Record<string, string>): void {
+  const norm = normalizeProviderKey(providerKey); if (!norm) return;
+  const key = norm;
+  const retryAfter = parseRetryAfterMs(pickHeader(headers, "Retry-After") ?? pickHeader(headers, "retry-after"));
+  const resetUnix = pickHeader(headers, "X-RateLimit-Reset") ?? pickHeader(headers, "x-ratelimit-reset");
+  const resetTokensUnix = pickHeader(headers, "X-RateLimit-Reset-Tokens") ?? pickHeader(headers, "x-ratelimit-reset-tokens");
+  let resetMs: number | undefined;
+  if (retryAfter != null) resetMs = Date.now() + retryAfter;
+  else if (resetUnix && /^\d+$/.test(resetUnix.trim())) resetMs = Number(resetUnix.trim()) * 1000;
+  else if (resetTokensUnix && /^\d+$/.test(resetTokensUnix.trim())) resetMs = Number(resetTokensUnix.trim()) * 1000;
+  if (resetMs == null || !Number.isFinite(resetMs) || resetMs <= Date.now()) return;
+  if (resetMs - Date.now() > 65000) return;
+  const prev = rateLimitResetAtMs.get(key);
+  if (prev == null || resetMs > prev) rateLimitResetAtMs.set(key, resetMs);
+}
+export function _resetRateLimitFeedbackForTest(providerKey?: string): void {
+  if (providerKey) { const k = normalizeProviderKey(providerKey); if (k) rateLimitResetAtMs.delete(k); }
+  else rateLimitResetAtMs.clear();
+}
+
 export function normalizeProviderKey(name: string | undefined): string | undefined {
   const k = typeof name === "string" ? name.trim().toLowerCase() : undefined;
   return k && k.length > 0 ? k : undefined;
@@ -102,7 +148,7 @@ export async function acquireProviderWindow(
       return;
     }
 
-    const waitMs = msToNextMinute() + attemptJitterMs;
+    const waitMs = msToReset(providerKey) + attemptJitterMs;
     if (Date.now() + waitMs > deadline) {
       // Exceeded max wait: caller will proceed and let upstream decide (will become real 429).
       return;
@@ -123,7 +169,7 @@ function waitForMinuteBoundary(providerKey: string, signal?: AbortSignal): Promi
     if (!signal) return cached.promise;
     // 有 signal 的等待者不能复用不可取消的 promise，单独建一个可取消的
   } else if (!signal) {
-    const ms = msToNextMinute();
+    const ms = msToReset(providerKey);
     const p = new Promise<void>((resolve) => {
       setTimeout(() => {
         pendingBoundary.delete(providerKey);
@@ -133,7 +179,7 @@ function waitForMinuteBoundary(providerKey: string, signal?: AbortSignal): Promi
     pendingBoundary.set(providerKey, { minute: curMinute, promise: p });
     return p;
   }
-  const ms = msToNextMinute();
+  const ms = msToReset(providerKey);
   let onAbort: (() => void) | undefined;
   return new Promise<void>((resolve, reject) => {
     const timer = setTimeout(() => {
@@ -173,4 +219,6 @@ export function windowSnapshot(providerKey: string): { minute: number; rpm: numb
 }
 export function _resetProviderWindowsForTest(): void {
   windows.clear();
+  rateLimitResetAtMs.clear();
+  pendingBoundary.clear();
 }
